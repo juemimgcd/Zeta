@@ -65,7 +65,8 @@ uv run zeta --version
 
 ## 核心学习路线
 
-[days/summary.md](days/summary.md) 为七个学习单元：状态与 Loop、工具调度与 Hooks/事件、Session、Memory、Context、Compaction、完整串联。
+先读 [Day 1 前置知识](days/prerequisites.md)，从对象、消息片段、工具调用配对和异步语法开始。
+[days/summary.md](days/summary.md) 为八个学习单元：状态与 Loop、工具调度与 Hooks/事件、Session、Memory、Context、Compaction、完整串联、Manager/Worker 多 Agent 编排。
 [days/support.md](days/support.md) 集中提供基础接入；[target.md](target.md) 定义目标与职责边界。
 
 Loop、Hooks、Session、Memory、Context 和 Compaction 仍待手写，不能把文档草图当作已实现功能。PydanticAI 只承担单次模型通信，不使用 Agent.run() 托管循环。

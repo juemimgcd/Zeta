@@ -1,129 +1,583 @@
-# Day 2：工具调度、Hooks 与事件生命周期
+# Day 2：新增 Hooks、事件与工具调度
 
-[总览](summary.md) · [配套基础代码](support.md)
+[总览](summary.md) · [固定基础代码](support.md)
 
 ## 核心问题
 
-模型提出工具请求后，谁决定能否执行？怎样在不改 Loop 主体的情况下加入检查和结果处理？你手写调度、Hook 的控制契约、事件顺序，以及预算和取消边界。
+在已经完成的循环中加入权限检查、结果处理和事件，怎样不改循环源码？今天新增 Hooks 与调度实现，配套 HookRuntime 负责连接 Day 1 已经预留好的调用位置。
 
-## 已提供与本日范围
+## 今天新增什么，哪些文件不动
 
-- 复用 read_file 和 ReadArgs，不重写文件 I/O 或 JSON 校验库。
-- 手写 `src/zeta/hooks.py` 的注册和调用、`tools.py` 的工具调度、`app.py` 的生命周期；`events.py` 承担最小事件发布。
-- 只用固定回调列表，不做动态插件发现、热加载或完整扩展框架。事件的终端排版和 JSON 编码直接复用或提供。
-- 可选阅读：Pi agent-loop.ts 与 types.ts 的 beforeToolCall、afterToolCall、shouldStopAfterTurn。下列 Hook 名称与约束是 Zeta 的设计，不宣称逐项对应 Pi API。
+**今天只新增：** `hooks.py`、`lifecycle.py`、`dispatch.py`、`hook_runtime.py`。每个文件的实现只在它所属的这一天给出。
 
-## 你手写的入口
+**保留不动：** support.md 的固定基础文件及前面各天已完成的全部文件。今天不替换 app.py，不重新填写 run_agent/run_loop，不复制一份旧循环改名。
+
+## 本日实现与边界
+
+- hooks.py：按注册顺序 await，快照隔离，按五类 Hook 分别检查返回契约。
+- lifecycle.py：观察性通知与控制决策分开；普通监听器错误不触发工具重放，取消传播。
+- dispatch.py：预期工具错误转 failed，拒绝转 denied，Hook 错误不包装成工具失败；保留 raw 与最终结果。
+- hook_runtime.py 是直接提供的接线代码，调用已有 Runtime 方法后加入 Hook/事件。新类扩展行为，不修改或重复实现 Runtime/run_loop。
+- 五个 Hook 分别为 before_model、after_model、before_tool、after_tool、after_turn；before_model 仅能添加低优先级数据，after_model 只读，after_tool 不可改 ID/名称/状态。
+
+## 完整练习骨架
+
+导包、异常类、字段、初始化和辅助实现已给出，只填 TODO 函数体。NotImplementedError 是未完成提示；移除它并填写真实逻辑后再验收。骨架暂时关闭未使用导入提示，其他类型检查保持开启。
+
+### src/zeta/hooks.py
+
+只填写：`Hooks.invoke`、`Hooks.register`。
 
 ```python
+# ruff: noqa: F401  # Prepared imports for exercise bodies.
+# pyright: reportUnusedImport=false
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Literal
+
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolReturnPart,
+    UserPromptPart,
+)
+
+from zeta.loop_common import validate_history
+
+type HookName = Literal[
+    "before_model", "after_model", "before_tool", "after_tool", "after_turn"
+]
+
+
+@dataclass(frozen=True)
+class Decision:
+    stop: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    name: str
+    call_id: str
+    path: str
+
+
+type HookContext = list[ModelMessage] | ModelResponse | ToolContext | ToolReturnPart
+type HookResult = list[ModelMessage] | ToolReturnPart | Decision | None
+type Callback = Callable[[HookContext], Awaitable[HookResult]]
+
+
 class Hooks:
-    def register(self, name, callback):
-        """只允许固定 Hook 名称，按注册顺序保存异步回调。"""
-        ...
+    def __init__(self) -> None:
+        self.callbacks: dict[HookName, list[Callback]] = {
+            name: []
+            for name in (
+                "before_model",
+                "after_model",
+                "before_tool",
+                "after_tool",
+                "after_turn",
+            )
+        }
 
-    async def invoke(self, name, context):
-        """逐个 await，检查返回契约；变换类回调接收上一项的新视图。"""
-        ...
+    def register(self, name: HookName, callback: Callback) -> None:
+        """TODO：拒绝未知名称，将回调追加到对应列表。"""
+        raise NotImplementedError("请完成 Hooks.register")
+
+    async def invoke(self, name: HookName, context: HookContext) -> HookResult:
+        """TODO：
+        1. 每次给回调深拷贝快照，逐个 await。
+        2. 按 Hook 类型验证返回值及修改边界。
+        3. 变换类串联新视图，决策类遇到 stop/deny 提前返回。
+        4. 不吞掉 Hook 异常和取消。"""
+        raise NotImplementedError("请完成 Hooks.invoke")
+```
+
+### src/zeta/lifecycle.py
+
+只填写：`emit`、`finish_event`。
+
+```python
+# ruff: noqa: F401  # Prepared imports for exercise bodies.
+# pyright: reportUnusedImport=false
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
-async def emit(event, listeners):
-    """按顺序通知观察者；返回值不参与执行决策。"""
-    ...
+@dataclass(frozen=True)
+class Event:
+    kind: str
+    detail: str = ""
+    call_id: str = ""
 
 
-async def execute_tool(call, workspace, hooks):
-    """参数校验 → before_tool → 执行或拒绝 → after_tool → 配对结果。"""
-    ...
+type Listener = Callable[[Event], Awaitable[None]]
 
 
-async def run_agent(
-    prompt: str,
+async def emit(event: Event, listeners: Sequence[Listener]) -> None:
+    """TODO：按本日契约实现 emit，写完与下方同名函数逐分支核对。"""
+    raise NotImplementedError("请完成 emit")
+
+
+async def finish_event(status: str, listeners: Sequence[Listener]) -> None:
+    """TODO：按本日契约实现 finish_event，写完与下方同名函数逐分支核对。"""
+    raise NotImplementedError("请完成 finish_event")
+```
+
+### src/zeta/dispatch.py
+
+只填写：`execute_tool`。
+
+```python
+# ruff: noqa: F401  # Prepared imports for exercise bodies.
+# pyright: reportUnusedImport=false
+import asyncio
+from collections.abc import Sequence
+from copy import deepcopy
+from pathlib import Path
+
+from pydantic import ValidationError
+from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+
+from zeta.hooks import Decision, Hooks, ToolContext
+from zeta.lifecycle import Event, Listener, emit
+from zeta.runtime_base import ToolExecution
+from zeta.tools import ReadArgs, ToolError, read_file
+
+
+async def execute_tool(
+    call: ToolCallPart,
     workspace: Path,
-    *,
-    max_requests: int = 8,
-    max_tool_calls: int = 16,
-    timeout: float = 120.0,
-) -> str:
-    """沿用 Day 1 Loop，加入 Hooks、事件和整个 run 的取消边界。"""
-    ...
+    hooks: Hooks,
+    listeners: Sequence[Listener] = (),
+) -> ToolExecution:
+    """TODO：按本日契约实现 execute_tool，写完与下方同名函数逐分支核对。"""
+    raise NotImplementedError("请完成 execute_tool")
 ```
 
-以上是入口草图，省略类型和依赖组装；不是完整可运行模块。先定义下面的输入/返回契约，再实现调用器。
+### src/zeta/hook_runtime.py
 
-### 五个 Hook：在哪运行、能改什么
+直接提供的接入代码，原样使用；内部调用前面已完成的方法，不重新实现它们。
 
-| Hook | 调用时机 | 最小返回契约与权限 |
-| --- | --- | --- |
-| before_model | 输入视图准备好之后、实际请求之前 | 返回新的输入视图或不变；不得原地修改原始历史、固定系统约束或工具权限。运行时再次校验配对与预算，Day 5 接入完整 Context 预算 |
-| after_model | 完整响应通过协议校验并进入历史之后、工具预检之前 | 只读观察，返回 None；第一版不允许改写模型原文或工具调用 |
-| before_tool | 固定工具查找与参数校验之后、实际执行之前 | 返回 allow 或 deny(reason)；拒绝即停止后续放行检查，结果仍带原调用 ID；不能绕过工具本身的工作区限制 |
-| after_tool | 得到成功、失败或拒绝结果之后、保存最终结果之前 | 返回受限结果视图或不变；保留原 ID、工具名、状态和原始结果，不得把失败/拒绝改成成功 |
-| after_turn | assistant 与全批工具结果已入历史之后 | 返回 continue 或 stop(reason)；任一 stop 即停止，不发下一轮请求 |
+```python
+from collections.abc import Sequence
+from pathlib import Path
 
-没有工具的最终回答也经过 after_model 和 after_turn。after_turn 的 continue 只是允许正常 Loop 规则继续，不能使已经得到最终回答的 Loop 无限追加请求。Hook 停止单独记录原因，不能伪装成模型正常完成。
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
 
-### Hook 与 Event 的区别
+from zeta.dispatch import execute_tool
+from zeta.hooks import Decision, Hooks
+from zeta.lifecycle import Event, Listener, emit, finish_event
+from zeta.loop_common import RunStopped
+from zeta.runtime_base import ModelIO, RunOptions, RunStatus, Runtime, ToolExecution
 
-Hook 在指定位置参与处理或决策；Event 通知已经发生的状态变化。两者都按注册顺序串行 await，但 Event 监听器只接收只读快照，返回值被忽略，不得改变权限和消息。
 
-最小事件：run_start、turn_start、model_response、tool_start、tool_end、turn_end、run_end。run_end 携带 completed / stopped / failed / cancelled 与原因，每个 run 只发一次。它表示运行终态已经确定；运行函数还需等监听器处理结束后才返回。
+class HookRuntime(Runtime):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        hooks: Hooks | None = None,
+        listeners: Sequence[Listener] = (),
+        io: ModelIO | None = None,
+        options: RunOptions | None = None,
+    ) -> None:
+        super().__init__(workspace, io=io, options=options)
+        self.hooks = hooks if hooks is not None else Hooks()
+        self.listeners = listeners
 
-成功路径固定为：
+    async def start(self, prompt: str | None) -> None:
+        await super().start(prompt)
+        await emit(Event("run_start"), self.listeners)
 
-```text
-run_start → turn_start
-→ before_model → 校验最终输入 → 请求模型 → 校验并保存完整响应
-→ after_model → model_response
-→ 整批 ID / 预算预检
-→ 每个工具：参数校验 → before_tool → tool_start（仅实际执行时）
-           → 执行或生成 failed/denied 结果 → after_tool
-           → 保存原始结果和最终视图 → tool_end（包括失败和拒绝）
-→ 整批结果配齐 → turn_end → after_turn
-→ 下一轮 turn_start，或保存终态 → run_end
+    async def begin_turn(self) -> None:
+        await emit(Event("turn_start"), self.listeners)
+
+    async def apply_before_model(
+        self, messages: list[ModelMessage]
+    ) -> list[ModelMessage]:
+        view = await self.hooks.invoke("before_model", messages)
+        if not isinstance(view, list):
+            raise TypeError("missing model input")
+        return view
+
+    async def prepare(self) -> list[ModelMessage]:
+        return await self.apply_before_model(await super().prepare())
+
+    async def on_response(self, response: ModelResponse) -> None:
+        await super().on_response(response)
+        await self.hooks.invoke("after_model", response)
+        await emit(Event("model_response"), self.listeners)
+
+    async def execute(self, call: ToolCallPart) -> ToolExecution:
+        return await execute_tool(call, self.workspace, self.hooks, self.listeners)
+
+    async def on_result(self, execution: ToolExecution) -> None:
+        await super().on_result(execution)
+        await emit(
+            Event("tool_end", execution.result.outcome, execution.result.tool_call_id),
+            self.listeners,
+        )
+
+    async def after_turn(self, results: list[ToolReturnPart]) -> None:
+        await super().after_turn(results)
+        await emit(Event("turn_end"), self.listeners)
+        decision = await self.hooks.invoke("after_turn", self.history)
+        if isinstance(decision, Decision) and decision.stop:
+            raise RunStopped(decision.reason)
+
+    async def finish(self, status: RunStatus, reason: str) -> None:
+        await finish_event(f"{status}: {reason}", self.listeners)
 ```
 
-Day 2 的“保存”先指内存状态，Day 3 换成可靠提交；每项结果先放入批次缓冲，齐批再组成 ModelRequest。不能在模型调用与结果之间注入普通消息。未知工具或非法参数直接生成 failed 结果，跳过 before_tool，仍经过 after_tool；无工具回答跳过工具阶段。
+## 怎样核对
 
-### 异常、预算与取消
+用 `run_agent(prompt, workspace, runtime=HookRuntime(workspace, hooks=你的策略))` 调用同一入口。注册实际路径拒绝策略，观察 denied 不执行；成功读取时核对 Hook 与事件顺序。拒绝也有 tool_end，只有实际执行才有 tool_start。
 
-| 情况 | 处理 |
-| --- | --- |
-| 工具非法参数、未知名称、文件不可读 | 仅将预期的工具异常转成同 ID 的 failed 结果 |
-| before_tool 拒绝 | 不执行，生成同 ID 的 denied 结果 |
-| 响应不完整、调用 ID 无效、Hook 返回违反契约 | 停止，不能带残缺批次继续请求 |
-| Hook 抛出异常 | 停止并记录 failed；不包装成可让模型重试的工具错误，也不默认放行 |
-| Event 监听器抛出普通异常 | 记录监听器诊断，继续通知其他观察者；不撤销已完成的工具，也不重新执行它 |
-| 预算耗尽、总超时、取消 | 分别记录停止/失败/取消原因，不继续下一项操作；CancelledError 传播 |
+不新增测试、mock、fixture 或内联自测。代码静态检查与实际模型/故障验收分开记录。
 
-持久化必须由明确的提交步骤负责，不能依赖允许失败的观察性监听器。异常处理应保留原始原因；终态通知不能吞掉取消，也不能让清理阶段的错误覆盖原失败。
+## 完整参考答案
 
-次数为正整数，timeout 正且有限；失败和拒绝调用也计数。执行前检查整批工具额度和下一次请求额度。总 timeout 覆盖请求、工具与 Hook 等待；终态通知使用单独的有界清理时间，不能无限等监听器。未预期的程序错误直接传播。
-
-## 怎样算完成
-
-1. 注册实际的 before_tool 策略，拒绝读取 `days/`；让模型请求读取 days/day1.md，确认没有执行、没有 tool_start，存在同 ID 的 denied 结果和 tool_end。
-2. 读取 README.md，观察五个 Hook 与事件顺序；after_model 能看见已入历史的完整响应，after_turn 能看见完整工具批次。
-3. 手动读取不存在的文件，确认 failed 经 after_tool 后仍为 failed；不得美化为成功。
-4. 在 Hook 或模型等待中按 Ctrl-C，确认不继续工具或模型请求。检查 Hook 异常与 Event 异常采用不同处理规则，未实际遇到的分支记为未验证。
-
-不为验收创建测试、mock 或故障注入回调；使用实际策略和调试器观察。能解释 Hook 的执行顺序、修改边界、失败规则，才算完成，而不只是注册了几个函数。
+答案只针对本日新增文件。前面各天的答案是被复用的依赖，不在这里再给修改版。
 
 <details>
-<summary>卡住再看：参考思路（算法说明，不是完整可运行答案）</summary>
+<summary>参考答案：src/zeta/hooks.py（完整文件）</summary>
 
-```text
-注册：固定名称 → 按注册顺序保存回调
-调用：逐个 await → 校验返回值 → 应用该 Hook 专属合并规则
-      before_model / after_tool：传递新视图，不传可变原始记录
-      before_tool：遇到 deny 即结束权限链
-      after_model：仅允许 None
-      after_turn：遇到 stop 即结束决策链
-Loop：按上面的成功路径安排调用点
-      把 Hook 调用放在工具预期异常捕获范围之外
-      全批结果配齐后才允许下一次请求
-结束：先保存终态，再有界通知 run_end，最后返回或传播原异常
+```python
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Literal
+
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolReturnPart,
+    UserPromptPart,
+)
+
+from zeta.loop_common import validate_history
+
+type HookName = Literal[
+    "before_model", "after_model", "before_tool", "after_tool", "after_turn"
+]
+
+
+@dataclass(frozen=True)
+class Decision:
+    stop: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    name: str
+    call_id: str
+    path: str
+
+
+type HookContext = list[ModelMessage] | ModelResponse | ToolContext | ToolReturnPart
+type HookResult = list[ModelMessage] | ToolReturnPart | Decision | None
+type Callback = Callable[[HookContext], Awaitable[HookResult]]
+
+
+class Hooks:
+    def __init__(self) -> None:
+        self.callbacks: dict[HookName, list[Callback]] = {
+            name: []
+            for name in (
+                "before_model",
+                "after_model",
+                "before_tool",
+                "after_tool",
+                "after_turn",
+            )
+        }
+
+    def register(self, name: HookName, callback: Callback) -> None:
+        if name not in self.callbacks:
+            raise ValueError("unknown hook")
+        self.callbacks[name].append(callback)
+
+    async def invoke(self, name: HookName, context: HookContext) -> HookResult:
+        if name not in self.callbacks:
+            raise ValueError("unknown hook")
+        current = deepcopy(context)
+        for callback in self.callbacks[name]:
+            result = await callback(deepcopy(current))
+            if result is None:
+                continue
+            if name == "before_model":
+                if not isinstance(current, list) or not isinstance(result, list):
+                    raise TypeError("before_model must return a message list")
+                if not current or len(result) < len(current):
+                    raise ValueError("hook cannot remove the prepared context")
+                if result[-len(current) :] != current:
+                    raise ValueError("hook cannot rewrite prepared messages")
+                for message in result[: -len(current)]:
+                    if (
+                        not isinstance(message, ModelRequest)
+                        or message.instructions
+                        or (not message.parts)
+                        or (
+                            not all(
+                                isinstance(p, UserPromptPart) for p in message.parts
+                            )
+                        )
+                    ):
+                        raise ValueError(
+                            "hook may only prepend user-level context data"
+                        )
+                validate_history(result)
+                current = deepcopy(result)
+            elif name == "after_tool":
+                if not isinstance(current, ToolReturnPart) or not isinstance(
+                    result, ToolReturnPart
+                ):
+                    raise TypeError("after_tool must return a tool result")
+                if (result.tool_name, result.tool_call_id, result.outcome) != (
+                    current.tool_name,
+                    current.tool_call_id,
+                    current.outcome,
+                ):
+                    raise ValueError("hook changed tool result identity or outcome")
+                current = deepcopy(result)
+            elif name in ("before_tool", "after_turn"):
+                if not isinstance(result, Decision):
+                    raise TypeError("decision hook must return Decision")
+                if result.stop:
+                    if not result.reason.strip():
+                        raise ValueError("a stop/deny decision needs a reason")
+                    return result
+            else:
+                raise TypeError("after_model is read-only and must return None")
+        if name in ("before_tool", "after_turn"):
+            return Decision()
+        if name == "after_model":
+            return None
+        if isinstance(current, (list, ToolReturnPart)):
+            return current
+        raise TypeError("invalid hook context")
 ```
 
-同步 read 可用 await asyncio.to_thread；取消等待不能强制终止线程内 I/O，因此此处只用于受限只读工具，不能直接作为 bash 的取消机制。
+</details>
+
+<details>
+<summary>参考答案：src/zeta/lifecycle.py（完整文件）</summary>
+
+```python
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Event:
+    kind: str
+    detail: str = ""
+    call_id: str = ""
+
+
+type Listener = Callable[[Event], Awaitable[None]]
+
+
+async def emit(event: Event, listeners: Sequence[Listener]) -> None:
+    for listener in tuple(listeners):
+        try:
+            await listener(event)
+        except Exception as error:  # noqa: BLE001 - intentional isolation or cleanup
+            logger.warning("event listener failed: %s", type(error).__name__)
+
+
+async def finish_event(status: str, listeners: Sequence[Listener]) -> None:
+    try:
+        async with asyncio.timeout(1.0):
+            await emit(Event("run_end", status), listeners)
+    except TimeoutError:
+        logger.warning("run_end listeners timed out")
+```
 
 </details>
+
+<details>
+<summary>参考答案：src/zeta/dispatch.py（完整文件）</summary>
+
+```python
+import asyncio
+from collections.abc import Sequence
+from copy import deepcopy
+from pathlib import Path
+
+from pydantic import ValidationError
+from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+
+from zeta.hooks import Decision, Hooks, ToolContext
+from zeta.lifecycle import Event, Listener, emit
+from zeta.runtime_base import ToolExecution
+from zeta.tools import ReadArgs, ToolError, read_file
+
+
+async def execute_tool(
+    call: ToolCallPart,
+    workspace: Path,
+    hooks: Hooks,
+    listeners: Sequence[Listener] = (),
+) -> ToolExecution:
+    raw: ToolReturnPart | None = None
+    args: ReadArgs | None = None
+    try:
+        if call.tool_name != "read":
+            raise ToolError("unknown tool")
+        args = (
+            ReadArgs.model_validate_json(call.args)
+            if isinstance(call.args, str)
+            else ReadArgs.model_validate(call.args)
+        )
+    except ValidationError, ToolError:
+        raw = ToolReturnPart(
+            tool_name=call.tool_name,
+            tool_call_id=call.tool_call_id,
+            content="unknown tool or invalid read arguments",
+            outcome="failed",
+        )
+    if args is not None:
+        decision = await hooks.invoke(
+            "before_tool", ToolContext(call.tool_name, call.tool_call_id, args.path)
+        )
+        if not isinstance(decision, Decision):
+            raise TypeError("missing tool decision")
+        if decision.stop:
+            raw = ToolReturnPart(
+                tool_name=call.tool_name,
+                tool_call_id=call.tool_call_id,
+                content=decision.reason,
+                outcome="denied",
+            )
+        else:
+            await emit(
+                Event("tool_start", call.tool_name, call.tool_call_id), listeners
+            )
+            try:
+                content = await asyncio.to_thread(read_file, args, workspace)
+            except ToolError as error:
+                raw = ToolReturnPart(
+                    tool_name=call.tool_name,
+                    tool_call_id=call.tool_call_id,
+                    content=str(error),
+                    outcome="failed",
+                )
+            else:
+                raw = ToolReturnPart(
+                    tool_name=call.tool_name,
+                    tool_call_id=call.tool_call_id,
+                    content=content,
+                )
+    if raw is None:
+        raise RuntimeError("missing raw tool result")
+    result = await hooks.invoke("after_tool", raw)
+    if not isinstance(result, ToolReturnPart):
+        raise TypeError("missing final tool result")
+    return ToolExecution(deepcopy(raw), deepcopy(result))
+```
+
+</details>
+
+<details>
+<summary>参考答案：src/zeta/hook_runtime.py（完整文件）</summary>
+
+```python
+from collections.abc import Sequence
+from pathlib import Path
+
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
+
+from zeta.dispatch import execute_tool
+from zeta.hooks import Decision, Hooks
+from zeta.lifecycle import Event, Listener, emit, finish_event
+from zeta.loop_common import RunStopped
+from zeta.runtime_base import ModelIO, RunOptions, RunStatus, Runtime, ToolExecution
+
+
+class HookRuntime(Runtime):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        hooks: Hooks | None = None,
+        listeners: Sequence[Listener] = (),
+        io: ModelIO | None = None,
+        options: RunOptions | None = None,
+    ) -> None:
+        super().__init__(workspace, io=io, options=options)
+        self.hooks = hooks if hooks is not None else Hooks()
+        self.listeners = listeners
+
+    async def start(self, prompt: str | None) -> None:
+        await super().start(prompt)
+        await emit(Event("run_start"), self.listeners)
+
+    async def begin_turn(self) -> None:
+        await emit(Event("turn_start"), self.listeners)
+
+    async def apply_before_model(
+        self, messages: list[ModelMessage]
+    ) -> list[ModelMessage]:
+        view = await self.hooks.invoke("before_model", messages)
+        if not isinstance(view, list):
+            raise TypeError("missing model input")
+        return view
+
+    async def prepare(self) -> list[ModelMessage]:
+        return await self.apply_before_model(await super().prepare())
+
+    async def on_response(self, response: ModelResponse) -> None:
+        await super().on_response(response)
+        await self.hooks.invoke("after_model", response)
+        await emit(Event("model_response"), self.listeners)
+
+    async def execute(self, call: ToolCallPart) -> ToolExecution:
+        return await execute_tool(call, self.workspace, self.hooks, self.listeners)
+
+    async def on_result(self, execution: ToolExecution) -> None:
+        await super().on_result(execution)
+        await emit(
+            Event("tool_end", execution.result.outcome, execution.result.tool_call_id),
+            self.listeners,
+        )
+
+    async def after_turn(self, results: list[ToolReturnPart]) -> None:
+        await super().after_turn(results)
+        await emit(Event("turn_end"), self.listeners)
+        decision = await self.hooks.invoke("after_turn", self.history)
+        if isinstance(decision, Decision) and decision.stop:
+            raise RunStopped(decision.reason)
+
+    async def finish(self, status: RunStatus, reason: str) -> None:
+        await finish_event(f"{status}: {reason}", self.listeners)
+```
+
+</details>
+
+## 与前后单元的关系
+
+Day 3 用新的 SessionRuntime 包装持久化，仍调用本日 HookRuntime；本日 hooks.py、dispatch.py、lifecycle.py 不修改。

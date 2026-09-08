@@ -1,73 +1,66 @@
-# Zeta 学习路线：手写 Agent 核心
+# Zeta 累积式学习路线：写一次，持续复用
 
-更新：2026-09-07。新编号按核心能力重新排列，不再对应旧版 Day 1–7。
+更新：2026-09-08。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
 
-目标是理解换框架后仍然成立的机制：Agent 怎样行动、记住信息、选择上下文、压缩历史、恢复工作。无需先背完 CLI、SDK 和流式事件 API，也无需逐文件翻译 Pi。
+## 使用规则
 
-## 怎么学
+第一次接触 PydanticAI 时，先读 [Day 1 前置知识：从 Python 对象到一次完整的工具调用](prerequisites.md)。其中具体解释消息与片段、调用编号、工具结果、异步语法，以及 Day 1 三个核心函数；这是一篇阅读材料，不增加新的实现任务。
 
-先用 [配套基础代码](support.md)，再从 Day 1 写循环。已有模型调用和 read 的部分可以复用，不必重做旧版前三天。
-每天只看“核心问题 → 手写入口 → 验收”，卡住再展开参考思路。参考思路是算法说明，不是整套可以覆盖源码的答案；support.md 明确区分已落地的 model_io.py 与待核心入口完成后接入的 CLI。
+1. 先准备 [固定基础代码](support.md)：app.py、Runtime 接入契约、配置、模型请求、CLI、SQLite 直接提供。
+2. 每天复制当天的完整骨架：导包、异常类、数据属性和初始化都已给出，只填标记的核心函数体。
+3. 写完后展开当天完整答案核对。已有正确实现保留；不要为了跟上下一天而整文件覆盖它。
+4. Day 1 的 run_loop 是唯一循环。Day 2/3 增加各自接入层，Day 7 组装，Day 8 复用；不再出现多个 run_agent 版本。
 
-“天”表示一个学习单元，不要求一天完成。前 7 个单元构成主线，后续内容按需要扩展，不再强制凑满 30 天。
+“天”是学习单元，完成并验收后再继续。基础实现选择可以简化，但已写函数的契约不会被后续课程推翻。
 
-## 哪些直接提供，哪些自己写
+## 八天主线与文件归属
 
-| 直接提供或复用 | 你手写的决策 |
-| --- | --- |
-| CLI 参数、环境变量、错误显示 | Loop 什么时候请求、执行、继续、停止 |
-| 单次模型请求、连接、消息类型、流式拼接 | 工具批次校验、权限、错误回传、预算和取消 |
-| 事件排版与 JSON 编码 | Hook 调用顺序、修改权限、拒绝与异常处理；事件发布时机 |
-| 文件读取、Pydantic 参数校验、数据库连接和消息序列化 | Session 保存什么、何时提交、从哪里恢复 |
-| SQLite CRUD、检索底层实现 | Memory 写入、作用域、召回、冲突、遗忘策略 |
-| token 估算器、摘要所需的一次模型调用 | Context 选择与排序、预算分配、Compaction 时机和保留边界 |
+| 单元 | 今天手写什么 | 今天新增文件 | 复用的已有内容 |
+| --- | --- | --- | --- |
+| [Day 1](day1.md) | 状态/协议校验、唯一 run_loop | loop_common.py、loop.py | 固定入口、Runtime、模型/read 基础代码 |
+| [Day 2](day2.md) | Hooks、事件、异步工具调度 | hooks.py、lifecycle.py、dispatch.py、hook_runtime.py | Day 1 循环原样保留；接入层直接提供 |
+| [Day 3](day3.md) | Session 提交与安全恢复 | session.py、session_runtime.py | Day 1/2 原样保留；接入层直接提供 |
+| [Day 4](day4.md) | remember/recall/forget | memory.py | 现有 Session 与 SQLite |
+| [Day 5](day5.md) | Context 选择、来源和预算 | context.py | 原始历史与 Memory |
+| [Day 6](day6.md) | 压缩边界、候选摘要 | compaction.py | Context 类型、无工具摘要请求 |
+| [Day 7](day7.md) | ContextRuntime 的组装和重试策略 | integration.py | 前六天全部实现；不新增循环 |
+| [Day 8](day8.md) | Manager/Worker 编排与共享预算 | team_budget.py、orchestration.py | 同一个 run_session_task 和 run_loop |
 
-PydanticAI direct 继续负责一次模型通信；不使用 `Agent.run()` 托管核心循环。第一版直接复用它的消息类型，不先造通用框架。以后换 SDK 时替换接入层，核心状态和策略仍由你掌握；消息类型迁移仍然需要适配，不能声称零成本切换。
+文件归属与完整基础代码详见 [support.md](support.md#文件所有权)。runtime_base.py 的默认行为真实可用，后续扩展只添加行为，不让你先补未来模块的空实现。
 
-## 核心主线
-
-| 单元 | 手写主题 | 当日闭环 |
-| --- | --- | --- |
-| [Day 1](day1.md) | Agent 状态、消息与 Loop | 模型提出 read → 执行 → 回传 → 最终回答 |
-| [Day 2](day2.md) | 工具调度、Hooks、事件与运行控制 | Hook 可拒绝与处理结果，事件顺序明确，预算和取消能停止 |
-| [Day 3](day3.md) | Session 与恢复边界 | 完整消息可保存，重启后从安全位置继续 |
-| [Day 4](day4.md) | Memory | 显式记住 → 跨 Session 召回 → 遗忘 |
-| [Day 5](day5.md) | Context | 按来源与预算选择本轮输入 |
-| [Day 6](day6.md) | Compaction | 压缩旧历史，保留近期完整交互与原始记录 |
-| [Day 7](day7.md) | 串联核心生命周期 | 召回、行动、压缩、恢复，并核对 Hook 时序和失败边界 |
+## 始终相同的执行链
 
 ```text
-Session 原始记录 + Memory + 项目指令
-  → Context 选择本轮输入（必要时 Compaction）
-  → before_model → 校验输入 → 请求一次 → 校验并保存响应 → after_model
-  → 有工具：校验 → before_tool → 执行/拒绝 → after_tool → 保存配对结果
-  → turn_end → after_turn → 下一轮或保存终态 → run_end
+固定 app.run_agent 或 integration.run_session_task
+  → Day 1 run_loop
+      → runtime.prepare：默认历史 / Hook / Context + Memory + Compaction
+      → 同一个 ModelIO 请求入口
+      → runtime.on_response：内存 / Session 提交 + Hook
+      → runtime.execute：基础 read / Day 2 调度
+      → runtime.on_result + after_turn：配对、保存、事件、停止决策
+      → 继续或准确终态
 ```
 
-Session 是发生过什么；Memory 是跨任务值得记住什么；Context 是这次实际发给模型什么；Compaction 是怎样缩短旧历史的模型视图。四者不要合成一个不断增长的 messages 列表。
+Runtime、HookRuntime、SessionRuntime、ContextRuntime 各自负责新增的一层行为；新方法通过已有方法完成原来的职责，不能把前一层源码复制进新文件。共享循环负责请求/工具预算和取消，策略层决定输入、提交和允许的重试。
 
-## 主线之后再选修
+## Manager / Worker
 
-按依赖推进，不必同时做：
+Day 8：Manager 生成结构化任务 → 多个隔离 Worker 限并发运行 → 收集证据和失败 → Manager 汇总。每个 Worker 有独立 Session、Memory scope 和只读路径权限，不继承父完整历史，也不能递归委派。
 
-1. 安全 Coding 工具：先审批策略，再接现成 write/edit/bash 实现；副作用默认串行，拒绝也留下对应结果。
-2. Session 分支与搜索：parent_id、active leaf、fork、FTS；分支摘要记录来源。
-3. 流式显示：复用请求适配层，只在完整响应后执行工具，同一套 Loop 保留全部决策。
-4. Worker：复用已完成的 Loop，先单个只读 Worker，再限并发；隔离上下文和工具权限，共享预算与取消，最多一层。
-5. Steering/Follow-up、扩展注册与崩溃恢复：在安全边界注入消息，识别不确定的副作用，不自动重放。
+共享预算覆盖 Manager、Worker、摘要和重试；父取消向下传播。Services 首次定义时就有 request/summarizer 字段，Day 8 只传实现，不修改 Day 7。此模式不声称复刻 Codex 内部实现，也不把多 Agent 称作 Pi 默认内置能力。
 
-Hook 的最小机制与事件生命周期已经在 Day 2；选修只扩展插件加载、工具注册等工程能力。事件排版可直接提供，决策与生命周期顺序由你手写。
+## 学习重点与边界
 
-SQLite 继续作为计划中的 Session、Memory 统一存储；JSON Lines 仅用于可选事件输出。数据库连接、SQL 拼装和终端排版不单独占学习日，进入对应单元时由配套实现承担。暂不做多 Provider、Web/TUI、向量库、递归 Worker 或 Pi 格式兼容。
+PydanticAI direct 只负责单次模型通信；Loop、Hooks、工具调度、Session、Memory、Context、Compaction、编排由 Zeta 掌握。不使用 Agent.run() 托管核心循环。
 
-## 本地参考与当前状态
+Session 是原始事实；Memory 是跨任务记录；Context 是本轮视图；Compaction 缩短视图但保留原始历史。工具调用/result 必须完整配对；权限拒绝不执行；恢复不自动重放不确定副作用。
 
-Pi 在 `/Users/jquery/python_files/pi`，只读参考。每天最多追一条相关调用链，不要求通读源码。Memory 是 Zeta 的学习设计，不假定 Pi 存在同名长期记忆模块。
+主线之后再做审批后的 write/edit/bash、Session 树与分支搜索、流式显示、Steering/Follow-up、任务 DAG 与受控返工、插件加载和恢复调度。不提前引入多 Provider、Web/TUI、向量库、递归 Worker、分布式执行或 Pi 文件格式兼容。
 
-当前 `src/zeta/app.py` 已有单次请求和文本流，`tools.py` 已有 read 和分派；CLI 仍接单次文本流，不能当成已完成工具 Loop。model_io.py 已提供完整响应的单次请求适配。Loop、Hooks、Session、Memory、Context、Compaction 是待手写目标；README 和 target.md 采用相同分工。
+Pi 源码只读参考位于 ../pi。Memory 与编排是 Zeta 的设计方向，不假定 Pi 有一一对应的完整模块。
 
-## 验收约定
+## 当前状态与验证
 
-每个单元检查一次实际状态变化，不以“回答看起来正确”代替工具或持久化证据。未观察到的分支标记未验证。
-完成源码修改后按相关范围运行项目已有 Ruff、Pyright 和 build；通用命令见 [support.md](support.md#完成源码练习后的检查)。文档更新不代表这些功能已实现或真实模型调用通过。
-不新增或修改测试、用例、mock、fixture、snapshot、内联自测。真实模型验收使用本地密钥，不写入文档和日志；不自动 commit/push。
+本路线与答案在 days 中，不能视为 src 已经实现。你已有的 app.py、loop_common.py、storage.py 等练习文件保留；本次不覆盖或迁移它们。若已写某个函数，先保留自己的实现再对照新归属，不删除已完成逻辑。
+
+按天检查骨架、完整答案与累积依赖，核对前一天文件未被后一天替换。静态检查不能代替真实模型、并发、取消、恢复和长会话验收；未观察到的分支标记未验证。不新增或修改测试、mock、fixture、snapshot 或内联自测，不自动 commit/push。

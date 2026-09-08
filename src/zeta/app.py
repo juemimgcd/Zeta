@@ -1,73 +1,20 @@
-from collections.abc import AsyncGenerator
+from pathlib import Path
 
-from pydantic_ai.direct import model_request, model_request_stream
-from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.messages import (
-    ModelRequest,
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPart,
-    TextPartDelta,
-    ToolCallPart,
-)
-
-from zeta.model_io import create_model
-
-INSTRUCTIONS = "You are Zeta, a concise local coding agent."
+from zeta.loop import run_loop
+from zeta.runtime_base import Runtime
 
 
-async def run_prompt(prompt: str) -> str:
-    """Request one complete text response; do not run an Agent loop."""
-    if not prompt.strip():
-        raise ValueError("prompt must not be empty")
-    request = ModelRequest.user_text_prompt(prompt, instructions=INSTRUCTIONS)
-    async with create_model() as model:
-        response = await model_request(
-            model, [request], model_settings={"timeout": 60.0}
-        )
-    text = response.text
-    if (
-        response.state != "complete"
-        or response.finish_reason != "stop"
-        or any(isinstance(part, ToolCallPart) for part in response.parts)
-        or text is None
-        or not text.strip()
-    ):
-        raise UnexpectedModelBehavior("incomplete or empty text response")
-    return text
-
-
-async def stream_prompt(prompt: str) -> AsyncGenerator[str]:
-    """Yield text only; let PydanticAI assemble the complete response."""
-    if not prompt.strip():
-        raise ValueError("prompt must not be empty")
-    request = ModelRequest.user_text_prompt(prompt, instructions=INSTRUCTIONS)
-    async with (
-        create_model() as model,
-        model_request_stream(
-            model, [request], model_settings={"timeout": 60.0}
-        ) as stream,
-    ):
-        async for event in stream:
-            if (
-                isinstance(event, PartStartEvent)
-                and isinstance(event.part, TextPart)
-                and event.part.content
-            ):
-                yield event.part.content
-            elif (
-                isinstance(event, PartDeltaEvent)
-                and isinstance(event.delta, TextPartDelta)
-                and event.delta.content_delta
-            ):
-                yield event.delta.content_delta
-        response = stream.get()
-    text = response.text
-    if (
-        response.state != "complete"
-        or response.finish_reason != "stop"
-        or any(isinstance(part, ToolCallPart) for part in response.parts)
-        or text is None
-        or not text.strip()
-    ):
-        raise UnexpectedModelBehavior("incomplete or empty text response")
+# 固定应用入口：prompt 为用户输入，workspace 为工具工作目录。
+# runtime 可传入已有运行对象；省略时创建基础 Runtime。
+# 异步返回最终回答字符串；请求、工具及运行错误继续向外传播。
+async def run_agent(
+        prompt: str, workspace: Path, *, runtime: Runtime | None = None
+) -> str:
+    """Stable, supplied entry point. The user's implementation lives in loop.py."""
+    # 条件表达式：传了 runtime 就使用它，否则创建默认对象。
+    active = runtime if runtime is not None else Runtime(workspace)
+    # 确认入口指定目录与运行对象的实际目录一致，避免使用错误的工具作用域。
+    if active.workspace != workspace.resolve(strict=True):
+        raise ValueError("runtime workspace mismatch")
+    # 进入唯一的 Agent 循环；后续更换 Runtime 行为也复用这个入口。
+    return await run_loop(prompt, active)
