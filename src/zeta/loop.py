@@ -3,23 +3,25 @@
 import asyncio
 import logging
 
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ToolReturnPart
+from langchain_core.messages import ToolMessage
+from openai import APIStatusError
 
 from zeta.loop_common import RunLimitError, response_calls, validate_history
 from zeta.runtime_base import RunStatus, Runtime
 
-# 当前模块的日志记录器；日志用于诊断，不是模型回复内容。
 logger = logging.getLogger(__name__)
 
 
-# 唯一循环的练习入口：prompt 为用户输入，runtime 保存状态并提供各步骤。
-# 目标是异步返回最终文字；当前文件尚未完成，以下注释不表示已能运行。
 async def run_loop(prompt: str | None, runtime: Runtime) -> str:
-    """Written once on Day 1; reused unchanged by every later lesson."""
+    """TODO：
+    1. 在总时限内启动 Runtime，维护请求与整批工具预算。
+    2. 按固定顺序准备输入、请求、校验、保存、执行和配对。
+    3. 调用固定接入点，不在循环里判断今天是第几天。
+    4. 正常返回文本；异常/取消保存原原因，最终完成有界清理。"""
     status: RunStatus = "failed"
     reason = ""
     primary: BaseException | None = None
+
     try:
         async with asyncio.timeout(runtime.options.timeout):
             await runtime.start(prompt)
@@ -30,26 +32,30 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                     validate_history(messages)
                     runtime.requests += 1
                     try:
+
                         response = await runtime.io.request(
-                            model, messages, max_tokens=runtime.options.output_tokens
+                            model,
+                            messages,
+                            max_tokens=runtime.options.output_tokens,
                         )
-                    except ModelHTTPError as error:
+                    except APIStatusError as err:
                         if (
                                 runtime.requests < runtime.options.max_requests
-                                and await runtime.retry(error)
+                                and await runtime.retry(err)
                         ):
                             continue
                         raise
+
                     calls = response_calls(response)
                     await runtime.on_response(response)
-                    results: list[ToolReturnPart] = []
+                    results: list[ToolMessage] = []
                     if calls:
                         if (
                                 runtime.requests >= runtime.options.max_requests
-                                or runtime.tool_calls + len(calls)
-                                > runtime.options.max_tool_calls
+                                or runtime.tool_calls + len(calls) > runtime.options.max_tool_calls
                         ):
                             raise RunLimitError("request or tool allowance exhausted")
+
                         runtime.tool_calls += len(calls)
                         for call in calls:
                             execution = await runtime.execute(call)
@@ -60,17 +66,18 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                         status = "completed"
                         return response.text or ""
                 raise RunLimitError("request allowance exhausted")
-    except BaseException as error:
-        primary = error
+    except BaseException as err:
+        primary = err
         status = (
             "cancelled"
-            if isinstance(error, asyncio.CancelledError)
-            else ("stopped" if isinstance(error, RunLimitError) else "failed")
+            if isinstance(err, asyncio.CancelledError)
+            else ("stopped" if isinstance(err, RunLimitError) else "failed")
         )
         reason = (
-            str(error) if isinstance(error, RunLimitError) else type(error).__name__
+            str(err) if isinstance(err, RunLimitError) else type(err).__name__
         )
         raise
+
     finally:
         try:
             await runtime.finish(status, reason)

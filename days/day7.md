@@ -21,6 +21,26 @@
 - request/summarizer 字段从本文件首次提供时就已存在，Day 8 只传入共享预算包装，不加字段、不改调用点。
 - run_session_task 只创建 ContextRuntime 并 await run_loop；没有第二个 while 或工具循环。
 
+## 先认识本日的类与函数
+
+| 类 | 它是什么 | 属性是什么意思 |
+| --- | --- | --- |
+| `Services` | 集中保存运行依赖的对象 | `database`：会话/摘要存储；`memories`：MemoryStore；`workspace`：工具目录；`budget`：上下文预算；`hooks`：回调管理器；`listeners`：事件监听函数；`resources`：参考资料；`recall_query`：显式检索文本；`request`：单次请求函数；`summarizer`：摘要函数 |
+| `ContextRuntime` | 继承 SessionRuntime，加入检索、上下文选择和压缩 | 新增 `services`：依赖集合；`query`：本次检索文本；`force_compaction`：下次 prepare 是否强制压缩；`overflow_retried`：是否用过超限重试机会 |
+
+继承的 database/session_id/allowed_scopes/owns_run 见 [Day 3](day3.md#先认识本日的类与函数)，hooks/listeners 见 [Day 2](day2.md#先认识本日的类与函数)，history/io/options 等见 [基础代码](support.md#先认识基础代码中的类与函数)。super() 调用父类方法，操作的仍是当前同一个对象。
+
+| 函数或方法 | 输入、功能和返回值 |
+| --- | --- |
+| `read_summary(services, session_id)` | 读取摘要并检查关联记忆仍存在、有效且可访问；返回 Summary，无摘要返回 None，失效则报错 |
+| `ContextRuntime.__init__(session_id, services, reviewed_resume=...)` | 把存储、Hook、模型函数和输出预算接入父类，初始化查询和压缩标志 |
+| `ContextRuntime.start(prompt)` | 先执行父类启动/恢复，再确定 query：优先 recall_query，其次 prompt，否则空串；返回 None |
+| `ContextRuntime.prepare()` | 读会话、recall 并记录记忆来源、读摘要、build_context；必要时 compact、重建并验证后保存摘要；最后 before_model 并复验历史/预算，返回消息列表 |
+| `ContextRuntime.retry(error)` | 识别特定 400 上下文超限错误，首次命中设置压缩及重试标志并返回 True，否则 False；本方法不发送请求 |
+| `run_session_task(session_id, prompt, services, reviewed_resume=...)` | 创建 ContextRuntime 并调用同一个 run_loop，返回最终回答；prompt=None 表示尝试恢复 |
+
+prepare 中的 `view` 是当前视图，`candidate` 是候选摘要，`candidate_view` 是使用新摘要重建的视图，`request_view` 是 Hook 处理后的最终消息列表。候选验证通过才保存。
+
 ## 完整练习骨架
 
 导包、异常类、字段、初始化和辅助实现已给出，只填 TODO 函数体。NotImplementedError 是未完成提示；移除它并填写真实逻辑后再验收。骨架暂时关闭未使用导入提示，其他类型检查保持开启。
@@ -36,8 +56,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage
+from langchain_core.messages import BaseMessage
+from openai import APIStatusError
 
 from zeta.compaction import choose_compaction_range, compact
 from zeta.context import (
@@ -117,7 +137,7 @@ class ContextRuntime(SessionRuntime):
         await super().start(prompt)
         self.query = self.services.recall_query or prompt or ""
 
-    async def prepare(self) -> list[ModelMessage]:
+    async def prepare(self) -> list[BaseMessage]:
         """TODO：
         1. 从现有 Session/Memory 模块获取输入。
         2. 调用 ContextBuilder，必要时生成并验证候选摘要。
@@ -125,7 +145,7 @@ class ContextRuntime(SessionRuntime):
         4. 返回模型视图，不请求模型、不执行工具、不另写循环。"""
         raise NotImplementedError("请完成 ContextRuntime.prepare")
 
-    async def retry(self, error: ModelHTTPError) -> bool:
+    async def retry(self, error: APIStatusError) -> bool:
         """TODO：只对已识别的上下文长度错误设置一次压缩重试标记；请求与次数由既有循环负责。"""
         raise NotImplementedError("请完成 ContextRuntime.retry")
 
@@ -159,8 +179,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage
+from langchain_core.messages import BaseMessage
+from openai import APIStatusError
 
 from zeta.compaction import choose_compaction_range, compact
 from zeta.context import (
@@ -240,7 +260,7 @@ class ContextRuntime(SessionRuntime):
         await super().start(prompt)
         self.query = self.services.recall_query or prompt or ""
 
-    async def prepare(self) -> list[ModelMessage]:
+    async def prepare(self) -> list[BaseMessage]:
         services = self.services
         session = load_session(self.database, self.session_id)
         memories = recall(
@@ -299,7 +319,7 @@ class ContextRuntime(SessionRuntime):
             raise RunLimitError("before_model exceeded the input allowance")
         return request_view
 
-    async def retry(self, error: ModelHTTPError) -> bool:
+    async def retry(self, error: APIStatusError) -> bool:
         detail = str(error.body).casefold()
         overflow = error.status_code == 400 and any(
             marker in detail

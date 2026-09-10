@@ -21,6 +21,42 @@ Manager 怎样生成独立子任务、限并发派发隔离 Worker，再按证�
 - run_worker 直接创建 Day 7 的 Services 并传 request/summarizer；不修改 integration.py。父取消向子传播；to_thread 中已开始的 read 仍可能完成。
 - 这是一轮 Manager → 多 Worker → 汇总，不声称复刻 Codex 内部实现，也不包含 DAG、递归派发或崩溃后自动恢复。
 
+## 先认识本日的类与函数
+
+Manager 负责规划和汇总，Worker 各自复用同一个 Agent 循环。以下对象分别保存预算、任务、证据和结果。
+
+| 类 | 它是什么 | 属性是什么意思 |
+| --- | --- | --- |
+| `SharedBudget` | 异步任务共享的请求账本 | `max_requests`：总请求上限；`max_tokens`：总计费额度；`final_tokens`：汇总预留；`requests`：已预订请求次数；`charged_tokens`：已结算量，缺 usage 按估算计；`actual_tokens`：收到 usage 的实际量累计；`in_flight`：未结算预订量；`lock`：保护检查和修改的 asyncio.Lock |
+| `WorkerTask` | 单个 Worker 的结构化任务 | `goal`：目标，长度 1–1500；`files`：分配文件名，1–8 项；`model_config`：严格校验和拒绝额外字段的类配置，不是任务内容 |
+| `Plan` | Manager 产出的计划 | `tasks`：1–4 个 WorkerTask；`model_config`：严格校验、拒绝额外字段 |
+| `Evidence` | 成功读取记录的定位信息 | `path`：授权文件名；`entry_id`：成功工具结果的 Entry ID；证明读取记录存在，不自动证明报告结论正确 |
+| `WorkerResult` | 一个 Worker 的执行结果 | `worker_id`：Worker 编号；`session_id`：会话编号；`status`：completed/failed/cancelled；`answer`：报告；`truncated`：报告是否截断；`evidence`：证据列表；`error`：失败异常类型说明 |
+| `TeamResult` | 整次编排返回结果 | `team_id`：运行编号；`answer`：汇总回答；`workers`：WorkerResult 列表；`requests`：请求次数；`actual_tokens`：有 usage 的累计实际量；`charged_tokens`：结算量；`partial`：是否存在未完成 Worker |
+
+SharedBudget 的计数器和 lock 使用 init=False，不作为构造参数。锁保护协程对账本的修改，不代表开启多线程。其余本日数据模型继承 BaseModel，负责结构化数据校验。
+
+| 函数或方法 | 输入、功能和返回值 |
+| --- | --- |
+| `SharedBudget.__post_init__()` | 初始化后自动校验参数，确保留出规划与汇总空间 |
+| `SharedBudget.reserve(estimate, final=False)` | 加锁检查额度，增加 requests/in_flight；非 final 为汇总保留一次请求和 final_tokens，返回 None |
+| `SharedBudget.settle(reserved, used)` | 释放预订量，按 usage 或预估更新账本，返回 None |
+| `SharedBudget.request(model, messages, tools=..., max_tokens=..., final=...)` | 估算 → 预订 → 请求 → finally 结算，返回 AIMessage，失败也结算预订量 |
+| `SharedBudget.request_read(model, messages, max_tokens=...)` | 给 request 带上 read 定义，返回 AIMessage，签名适配 ModelIO.request |
+| `SharedBudget.summarize(prompt)` | 创建模型，通过共享预算发送无工具摘要请求，检查响应后返回正文 |
+| `resolve_files(workspace, names)` | 解析实际路径并检查目录边界和敏感路径，返回规范相对文件名 → Path 字典 |
+| `plan_tasks(goal, authorized, budget)` | 请求 JSON 计划，用 Plan 校验并核对文件权限，返回 Plan，不执行 Worker |
+| `worker_hooks(workspace, allowed)` | 创建 Hooks，注册内部 restrict_tool 到 before_tool，返回管理器；allowed 是该 Worker 获准访问的实际路径集合 |
+| 内部回调 `restrict_tool(context)` | 接收 ToolContext，检查只用 read 且实际路径在 allowed 内，返回放行或带理由的拒绝 Decision，由 invoke 调用 |
+| `collect_evidence(database, session_id, allowed, workspace)` | 从持久化消息配对授权 read 与成功结果，返回 Evidence 列表，不直接采信报告自述 |
+| `run_worker(worker_id, task, workspace, authorized, folder, budget, semaphore, finished)` | 在并发额度内创建独立数据库/会话/范围/Hook，限时执行并提取证据，关闭数据库；返回 WorkerResult 并更新 finished；取消时记录后重新抛出 |
+| `dispatch_workers(plan, workspace, authorized, folder, budget, finished, concurrency=2)` | 用信号量限制并发、TaskGroup 启动和等待 Worker，返回按计划顺序排列的结果 |
+| `synthesize(goal, results, budget)` | 将报告、证据和失败信息交给 Manager，用 final=True 请求汇总，返回文字 |
+| `run_manager(goal, workspace, allowed_files, concurrency=2)` | 校验文件，创建团队存储和预算，规划 → 执行 → 汇总并记账，返回 TeamResult；错误/取消记终态后传播 |
+| 内部函数 `save(status, answer="")` | 供 run_manager 使用，把计划、finished、状态、答案和预算写入 Manager 数据库，返回 None |
+
+`finished` 是 Worker ID → WorkerResult 的字典；`semaphore` 限制同时进入 Worker 主体的数量；`tasks` 保存 asyncio.Task 对象。restrict_tool 保留外层 workspace/allowed 的引用，这叫闭包，因此 invoke 只需传 context。
+
 ## 完整练习骨架
 
 导包、异常类、字段、初始化和辅助实现已给出，只填 TODO 函数体。NotImplementedError 是未完成提示；移除它并填写真实逻辑后再验收。骨架暂时关闭未使用导入提示，其他类型检查保持开启。
@@ -37,16 +73,13 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from pydantic_ai.direct import model_request
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
-from pydantic_ai.models import ModelRequestParameters
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.tools import ToolDefinition
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_openai import ChatOpenAI
 
 from zeta.loop_common import RunLimitError, response_calls
-from zeta.model_io import create_model
+from zeta.model_io import create_model, request_with_tools
 from zeta.session import encode
-from zeta.tools import TOOL_DEFINITIONS
+from zeta.tools import TOOL_DEFINITIONS, ToolSchema
 
 
 @dataclass
@@ -79,16 +112,14 @@ class SharedBudget:
 
     async def request(
         self,
-        model: OpenAIChatModel,
-        messages: Sequence[ModelMessage],
+        model: ChatOpenAI,
+        messages: Sequence[BaseMessage],
         *,
-        tools: Sequence[ToolDefinition] = (),
+        tools: Sequence[ToolSchema] = (),
         max_tokens: int = 2048,
         final: bool = False,
-    ) -> ModelResponse:
-        schemas = json.dumps(
-            [tool.parameters_json_schema for tool in tools], ensure_ascii=False
-        )
+    ) -> AIMessage:
+        schemas = json.dumps(list(tools), ensure_ascii=False)
         estimate = (
             len(encode(messages).encode("utf-8"))
             + len(schemas.encode("utf-8"))
@@ -98,26 +129,25 @@ class SharedBudget:
         await self.reserve(estimate, final=final)
         used: int | None = None
         try:
-            response = await model_request(
-                model,
-                messages,
-                model_settings={"timeout": 60.0, "max_tokens": max_tokens},
-                model_request_parameters=ModelRequestParameters(
-                    function_tools=list(tools)
-                ),
+            response = await request_with_tools(
+                model, messages, tools=tools, max_tokens=max_tokens
             )
-            used = response.usage.total_tokens
+            used = (
+                None
+                if response.usage_metadata is None
+                else response.usage_metadata["total_tokens"]
+            )
             return response
         finally:
             await self.settle(estimate, used)
 
     async def request_read(
         self,
-        model: OpenAIChatModel,
-        messages: Sequence[ModelMessage],
+        model: ChatOpenAI,
+        messages: Sequence[BaseMessage],
         *,
         max_tokens: int = 2048,
-    ) -> ModelResponse:
+    ) -> AIMessage:
         return await self.request(
             model,
             messages,
@@ -127,9 +157,7 @@ class SharedBudget:
 
     async def summarize(self, prompt: str) -> str:
         async with create_model() as model:
-            response = await self.request(
-                model, [ModelRequest.user_text_prompt(prompt)]
-            )
+            response = await self.request(model, [HumanMessage(content=prompt)])
         if response_calls(response):
             raise ValueError("summary unexpectedly requested tools")
         return response.text or ""
@@ -149,8 +177,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolReturnPart
 
 from zeta.hooks import Decision, HookContext, Hooks, ToolContext
 from zeta.integration import Services, run_session_task
@@ -285,16 +313,13 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from pydantic_ai.direct import model_request
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
-from pydantic_ai.models import ModelRequestParameters
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.tools import ToolDefinition
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_openai import ChatOpenAI
 
 from zeta.loop_common import RunLimitError, response_calls
-from zeta.model_io import create_model
+from zeta.model_io import create_model, request_with_tools
 from zeta.session import encode
-from zeta.tools import TOOL_DEFINITIONS
+from zeta.tools import TOOL_DEFINITIONS, ToolSchema
 
 
 @dataclass
@@ -340,16 +365,14 @@ class SharedBudget:
 
     async def request(
         self,
-        model: OpenAIChatModel,
-        messages: Sequence[ModelMessage],
+        model: ChatOpenAI,
+        messages: Sequence[BaseMessage],
         *,
-        tools: Sequence[ToolDefinition] = (),
+        tools: Sequence[ToolSchema] = (),
         max_tokens: int = 2048,
         final: bool = False,
-    ) -> ModelResponse:
-        schemas = json.dumps(
-            [tool.parameters_json_schema for tool in tools], ensure_ascii=False
-        )
+    ) -> AIMessage:
+        schemas = json.dumps(list(tools), ensure_ascii=False)
         estimate = (
             len(encode(messages).encode("utf-8"))
             + len(schemas.encode("utf-8"))
@@ -359,26 +382,25 @@ class SharedBudget:
         await self.reserve(estimate, final=final)
         used: int | None = None
         try:
-            response = await model_request(
-                model,
-                messages,
-                model_settings={"timeout": 60.0, "max_tokens": max_tokens},
-                model_request_parameters=ModelRequestParameters(
-                    function_tools=list(tools)
-                ),
+            response = await request_with_tools(
+                model, messages, tools=tools, max_tokens=max_tokens
             )
-            used = response.usage.total_tokens
+            used = (
+                None
+                if response.usage_metadata is None
+                else response.usage_metadata["total_tokens"]
+            )
             return response
         finally:
             await self.settle(estimate, used)
 
     async def request_read(
         self,
-        model: OpenAIChatModel,
-        messages: Sequence[ModelMessage],
+        model: ChatOpenAI,
+        messages: Sequence[BaseMessage],
         *,
         max_tokens: int = 2048,
-    ) -> ModelResponse:
+    ) -> AIMessage:
         return await self.request(
             model,
             messages,
@@ -388,9 +410,7 @@ class SharedBudget:
 
     async def summarize(self, prompt: str) -> str:
         async with create_model() as model:
-            response = await self.request(
-                model, [ModelRequest.user_text_prompt(prompt)]
-            )
+            response = await self.request(model, [HumanMessage(content=prompt)])
         if response_calls(response):
             raise ValueError("summary unexpectedly requested tools")
         return response.text or ""
@@ -409,8 +429,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolReturnPart
 
 from zeta.hooks import Decision, HookContext, Hooks, ToolContext
 from zeta.integration import Services, run_session_task
@@ -492,7 +512,7 @@ async def plan_tasks(
         )
     )
     async with create_model() as model:
-        response = await budget.request(model, [ModelRequest.user_text_prompt(prompt)])
+        response = await budget.request(model, [HumanMessage(content=prompt)])
     if response_calls(response):
         raise ValueError("planner may not execute tools")
     plan = Plan.model_validate_json(response.text or "")
@@ -534,31 +554,25 @@ def collect_evidence(
     evidence: list[Evidence] = []
     for entry in load_session(database, session_id).entries:
         message = decode(entry)
-        if isinstance(message, ModelResponse):
+        if isinstance(message, AIMessage):
             for call in response_calls(message):
-                if call.tool_name == "read":
+                if call["name"] == "read":
                     try:
-                        args = (
-                            ReadArgs.model_validate_json(call.args)
-                            if isinstance(call.args, str)
-                            else ReadArgs.model_validate(call.args)
-                        )
+                        args = ReadArgs.model_validate(call["args"])
                         path = (workspace / args.path).resolve(strict=True)
                     except ValueError, OSError, RuntimeError:
                         continue
                     for name, authorized_path in allowed.items():
                         if path == authorized_path:
-                            calls[call.tool_call_id] = name
-        else:
-            for part in message.parts:
-                if (
-                    isinstance(part, ToolReturnPart)
-                    and part.outcome == "success"
-                    and (part.tool_call_id in calls)
-                ):
-                    evidence.append(
-                        Evidence(path=calls.pop(part.tool_call_id), entry_id=entry.id)
-                    )
+                            calls[(call["id"] or "")] = name
+        elif (
+            isinstance(message, ToolMessage)
+            and message.status == "success"
+            and message.tool_call_id in calls
+        ):
+            evidence.append(
+                Evidence(path=calls.pop(message.tool_call_id), entry_id=entry.id)
+            )
     return evidence
 
 
@@ -668,7 +682,7 @@ async def synthesize(
     )
     async with create_model() as model:
         response = await budget.request(
-            model, [ModelRequest.user_text_prompt(prompt)], final=True
+            model, [HumanMessage(content=prompt)], final=True
         )
     if response_calls(response):
         raise ValueError("synthesis may not execute tools")

@@ -1,10 +1,10 @@
 """A fixed, workspace-scoped read tool."""
 
 from pathlib import Path
+from typing import Any
 
+from langchain_core.messages import ToolCall, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
-from pydantic_ai.tools import ToolDefinition
 
 # 读取文件的字节上限：32768 字节，不是 32768 个汉字。
 MAX_READ_BYTES = 32_768
@@ -39,7 +39,7 @@ def read_file(args: ReadArgs, workspace: Path) -> str:
         # 取得相对路径；这里 relative.parts 是路径组件元组，不是模型响应 parts。
         relative = target.relative_to(root)
         if any(
-            p == ".git" or p == ".env" or p.startswith(".env.") for p in relative.parts
+                p == ".git" or p == ".env" or p.startswith(".env.") for p in relative.parts
         ):
             raise ToolError("reading this path is denied")
         if not target.is_file():
@@ -64,41 +64,45 @@ def read_file(args: ReadArgs, workspace: Path) -> str:
 
 
 # 给模型看的工具说明表，键是工具名称；它不自动调用本地 read_file。
-TOOL_DEFINITIONS = {
-    "read": ToolDefinition(
-        name="read",
-        description="Read a UTF-8 workspace file of at most 32768 bytes.",
-        # 由参数模型生成 JSON Schema，描述 path 的类型、必填和额外字段规则。
-        parameters_json_schema=ReadArgs.model_json_schema(),
-        # 服务商工具 schema 的严格模式开关，与本地 ReadArgs.strict 是不同层。
-        strict=False,
-    )
+type ToolSchema = dict[str, Any]
+TOOL_DEFINITIONS: dict[str, ToolSchema] = {
+    "read": {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a UTF-8 workspace file of at most 32768 bytes.",
+            "parameters": ReadArgs.model_json_schema(),
+        },
+    }
 }
 
 
-# 接收模型给出的 ToolCallPart，校验名称/参数并执行 read，返回 ToolReturnPart。
+# 接收模型给出的 ToolCall，校验名称/参数并执行 read，返回 ToolMessage。
 # Day 1 遇到预期失败会抛 ToolError 停止；这里尚不包装 failed 结果继续运行。
-def execute_tool(call: ToolCallPart, workspace: Path) -> ToolReturnPart:
+def execute_tool(call: ToolCall, workspace: Path) -> ToolMessage:
     """Dispatch the fixed read tool; the Day 1 baseline stops on expected tool failure."""
     # tool_name 是要调用哪个工具；只接受固定定义表中的名称。
-    if call.tool_name not in TOOL_DEFINITIONS:
+    if call["name"] not in TOOL_DEFINITIONS:
         raise ToolError("unknown tool")
     try:
-        # call.args 可以是 JSON 字符串或字典：分别选择 JSON 解析校验和对象校验。
+        # LangChain 的 ToolCall["args"] 已是字典；invalid_tool_calls 由 response_calls 拒绝。
         # 成功后得到 ReadArgs 实例，使用 args.path 读取路径字段。
-        args = (
-            ReadArgs.model_validate_json(call.args)
-            if isinstance(call.args, str)
-            else ReadArgs.model_validate(call.args)
-        )
+        args = ReadArgs.model_validate(call["args"])
     except ValidationError:
         raise ToolError("read expects an object with a string path only") from None
     # 先执行 read_file 得到正文，再包装为工具结果对象；此处尚未发回模型。
-    return ToolReturnPart(
+    return ToolMessage(
         # 沿用调用中的工具名称，例如 read。
-        tool_name=call.tool_name,
+        name=call["name"],
         # 沿用这一次调用的编号，不能另造 ID；模型靠它识别结果对应哪个调用。
-        tool_call_id=call.tool_call_id,
+        tool_call_id=(call["id"] or ""),
         # content 保存实际读取正文，不是模型猜测的文件内容。
         content=read_file(args, workspace),
     )
+
+
+def tool_outcome(message: ToolMessage) -> str:
+    """Retain the original success/failed/denied event vocabulary locally."""
+    if message.status == "success":
+        return "success"
+    return "denied" if message.artifact == {"outcome": "denied"} else "failed"

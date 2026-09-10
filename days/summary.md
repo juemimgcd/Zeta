@@ -1,10 +1,10 @@
 # Zeta 累积式学习路线：写一次，持续复用
 
-更新：2026-09-08。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
+更新：2026-09-10。基于 GitHub 9359d5f 原版，仅迁移 LangChain 接入。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
 
 ## 使用规则
 
-第一次接触 PydanticAI 时，先读 [Day 1 前置知识：从 Python 对象到一次完整的工具调用](prerequisites.md)。其中具体解释消息与片段、调用编号、工具结果、异步语法，以及 Day 1 三个核心函数；这是一篇阅读材料，不增加新的实现任务。
+第一次接触 LangChain 时，先读 [Day 1 前置知识：从 Python 对象到一次完整的工具调用](prerequisites.md)。其中具体解释消息与片段、调用编号、工具结果、异步语法，以及 Day 1 三个核心函数；这是一篇阅读材料，不增加新的实现任务。
 
 1. 先准备 [固定基础代码](support.md)：app.py、Runtime 接入契约、配置、模型请求、CLI、SQLite 直接提供。
 2. 每天复制当天的完整骨架：导包、异常类、数据属性和初始化都已给出，只填标记的核心函数体。
@@ -12,6 +12,12 @@
 4. Day 1 的 run_loop 是唯一循环。Day 2/3 增加各自接入层，Day 7 组装，Day 8 复用；不再出现多个 run_agent 版本。
 
 “天”是学习单元，完成并验收后再继续。基础实现选择可以简化，但已写函数的契约不会被后续课程推翻。
+
+## 类、属性与函数的阅读入口
+
+Day 1–8 的练习骨架前均有对象/函数说明：类的职责、字段含义、函数输入和返回值；没有新类的 Day 6 则说明复用类型和摘要回调。骨架与参考答案共用这份说明，原有练习顺序保留。
+
+公共对象先查 [support.md](support.md#先认识基础代码中的类与函数)，Python 语法查 [prerequisites.md](prerequisites.md)。Day 2 的 callback、context、invoke 修改和决策规则有 [具体示例与分支讲解](hooks-explained.md#9-invoke-的实际回调与逐分支解释)。这些解释描述教学答案，不表示 src 中的练习已经完成。
 
 ## 八天主线与文件归属
 
@@ -51,7 +57,7 @@ Day 8：Manager 生成结构化任务 → 多个隔离 Worker 限并发运行 �
 
 ## 学习重点与边界
 
-PydanticAI direct 只负责单次模型通信；Loop、Hooks、工具调度、Session、Memory、Context、Compaction、编排由 Zeta 掌握。不使用 Agent.run() 托管核心循环。
+LangChain ChatOpenAI.ainvoke 只负责单次模型通信；Loop、Hooks、工具调度、Session、Memory、Context、Compaction、编排由 Zeta 掌握。不使用 LangChain create_agent / AgentExecutor 或 LangGraph 托管核心循环。
 
 Session 是原始事实；Memory 是跨任务记录；Context 是本轮视图；Compaction 缩短视图但保留原始历史。工具调用/result 必须完整配对；权限拒绝不执行；恢复不自动重放不确定副作用。
 

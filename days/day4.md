@@ -19,6 +19,22 @@
 - recall 先过滤 active 和 scope，再按关键词命中数稳定排序、去重、限量；这不是语义检索。
 - forget 只将记忆失效，不删除原 Session；冲突记录保留来源，人工决定，不宣称自动语义冲突检测已完成。
 
+## 先认识本日的类与函数
+
+| 类 | 它是什么 | 属性是什么意思 |
+| --- | --- | --- |
+| `Memory` | 一条经过确认、带来源的长期记忆，继承 BaseModel | `id`：记忆编号；`text`：正文；`scope`：所属范围；`source_entry_id`：来源 Entry 编号；`created_at`：UTC 创建时间；`active`：是否有效，遗忘后为 False |
+| `MemoryStore` | 包装存储和访问范围的管理对象 | `database`：JsonStore；`allowed_scopes`：可信调用方提供的允许范围集合 |
+
+| 函数或方法 | 输入、功能和返回值 |
+| --- | --- |
+| `MemoryStore.__init__(database, allowed_scopes)` | 保存数据库和非空允许范围，空集合抛异常 |
+| `remember(store, text, scope, source_entry_id, confirmed=...)` | 要求确认、合法正文/范围及允许范围内真实存在的来源记录；同范围同正文有效记忆去重，否则保存新记忆；返回 Memory |
+| `recall(store, query, allowed_scopes, limit=5)` | 在请求范围内按查询词命中数排序、去重有效记忆，返回至多 limit 条 Memory；范围不能超出 store 权限，无匹配时返回空列表 |
+| `forget(store, memory_id, confirmed=...)` | 要求确认并检查范围，把 active 改为 False 后保存；返回 None，数据库记录仍保留 |
+
+`confirmed` 是调用方传入的布尔参数，函数不会自己弹确认窗口。recall 是简单关键词匹配，不是向量检索。创建对象、保存对象、把检索结果加入模型输入是不同动作；最后一步在 Day 7 接入。
+
 ## 完整练习骨架
 
 导包、异常类、字段、初始化和辅助实现已给出，只填 TODO 函数体。NotImplementedError 是未完成提示；移除它并填写真实逻辑后再验收。骨架暂时关闭未使用导入提示，其他类型检查保持开启。

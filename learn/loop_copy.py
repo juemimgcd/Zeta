@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+from langchain_core.messages import ToolMessage
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ToolReturnPart
 
@@ -20,8 +21,8 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
     primary:BaseException | None = None
     try:
         async with asyncio.timeout(runtime.options.timeout):
+            await runtime.start(prompt)
             async with runtime.io.factory() as model:
-                await runtime.start(prompt)
                 while runtime.requests < runtime.options.max_requests:
                     await runtime.begin_turn()
                     messages = await runtime.prepare()
@@ -30,7 +31,7 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                         response = await runtime.io.request(
                             model,
                             messages,
-                            max_tokens=runtime.options.max_tokens,
+                            max_tokens=runtime.options.output_tokens
                         )
                     except ModelHTTPError as e:
                         if (
@@ -39,45 +40,70 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                         ):
                             continue
                         raise
-
                     calls = response_calls(response)
-                    results:list[ToolReturnPart] = []
                     await runtime.on_response(response)
+                    result:list[ToolMessage] = []
                     if calls:
                         if (
-                            runtime.requests > runtime.options.max_requests
-                            or runtime.tool_calls + len(calls) > runtime.options.max_tokens
+                            runtime.tool_calls + len(calls) > runtime.options.max_tool_calls
+                            or runtime.requests >= runtime.options.max_requests
                         ):
-                            raise RunLimitError("model ")
+                            raise RuntimeError()
 
+                        runtime.tool_calls + len(calls)
                         for call in calls:
                             execution = await runtime.execute(call)
                             await runtime.on_result(execution)
-                            results.append(execution.result)
-                        runtime.tool_calls += len(calls)
-                    await runtime.after_turn(results)
+                            result.append(execution.result)
+                    await runtime.after_turn(result)
                     if not calls:
                         status = "completed"
                         return response.text or ""
-                raise RunLimitError("model ")
-    except BaseException as error:
-        primary = error
+
+
+
+                raise RunLimitError("ppppp")
+
+
+
+
+    except BaseException as e:
+        primary = e
         status = (
             "cancelled"
-            if isinstance(error, asyncio.CancelledError)
-            else ("stopped" if isinstance(error, RunLimitError) else "failed")
+            if isinstance(e,asyncio.CancelledError)
+            else ("stopped" if isinstance(e,RuntimeError) else "failed")
         )
         reason = (
-            str(error) if isinstance(error, RunLimitError) else type(error).__name__
+            str(e) if isinstance(e,RuntimeError) else type(e).__name__
         )
         raise
+
     finally:
         try:
-            await runtime.finish(status, reason)
-        except BaseException as cleanup_error:
-            if primary is None:
-                raise
-            logger.warning("cleanup failed: %s", type(cleanup_error).__name__)
+            await runtime.finish(status,reason)
+        except RunLimitError as e:
+            logger.error(e)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

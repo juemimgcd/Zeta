@@ -2,93 +2,72 @@
 
 [学习总览](summary.md) · [Day 1 练习](day1.md) · [固定基础代码](support.md)
 
-这篇文章假设你第一次接触 PydanticAI，不知道消息对象、工具调用协议，也不熟悉这些类的字段。目标是让你读懂 Day 1 已经出现的代码，再去填写练习。本文不新增实现任务，也不要求重写你已经完成的函数。
+本篇保留 GitHub `9359d5f` 原版的阅读顺序：对象与消息 → 工具配对 → Runtime 与异步 → Day 1 三个函数逐段解释。只将 PydanticAI 的类型、字段和调用方式换成 LangChain，不另设一套简化课程。
 
-本文依据 **2026-09-08 本项目实际安装的 `pydantic-ai-slim==2.37.0`**、`days/day1.md`、`days/support.md` 和现有 `src/zeta/tools.py` 编写。网上的最新版文档可能发生变化，字段名和值以这个版本为准。文中的具体 ID、文件正文和模型回答都是**讲解用的示意值**，不是本次真实请求模型的记录；对象片段用于阅读，不是让你另外建立测试或复制一套 Agent。
+接口已在临时环境中核对：`langchain-openai==1.6.2`、`langchain-core==1.6.2`。项目现有源码尚未因此迁移；示例中的 ID、正文和回答是结构示意，不是真实模型运行记录，不需要另建测试。
 
-先回答你最关心的三个问题：
+先回答最容易混淆的三个问题：
 
-- **`response.parts`**：从 `response` 这个响应对象上取出“消息片段序列”。里面的元素可能是文字对象，也可能是工具调用对象等，不能假定都是字符串。
-- **`tool_call_id`**：一个字符串属性，表示“这一次工具调用的编号”，不是函数。结果要带回同一个编号，才能知道它回答了哪一次调用。
-- **`ToolReturnPart`**：PydanticAI 提供的类。我们用它把本地工具执行得到的结果包装成一个对象，再放进下一次发给模型的消息里。它本身不执行工具。
+- `response` 是 LangChain 的 `AIMessage` 对象；文字看 `content` / `text`，调用看 `tool_calls`。
+- `response.tool_calls` 是列表，每项 `ToolCall` 在运行时是字典，用 `call["name"]`、`call["args"]`、`call["id"]` 读取。
+- `ToolMessage` 是一条独立的工具结果消息。它带回调用 ID，直接加入历史，不再放进 ModelRequest 的 parts 中。
 
-建议分三遍读：第一遍读第 1–8 节，认识数据长什么样；第二遍读第 9–13 节，看数据怎样流动；第三遍对照第 14–18 节逐行读 Day 1。遇到符号可以查第 19 节，不必一次背完。
+建议分三遍读：第 1–8 节认识数据；第 9–13 节看请求、Runtime 和异步；第 14–20 节对照 Day 1 的代码。已有函数不要为了对照答案整文件覆盖。
 
-| 阅读范围 | 解决的问题 |
-| --- | --- |
-| 第 1–2 节：包和 Python 语法 | import、类、对象、属性、方法、类型注解怎么看？ |
-| 第 3–6 节：消息与工具片段 | parts 里装什么？调用编号如何对应结果？ |
-| 第 7–8 节：完整交互与状态 | 两次模型请求之间发生了什么？complete 和 stop 为什么不能混用？ |
-| 第 9–10 节：工具和请求接口 | 参数怎么校验？哪一行执行工具？哪一行请求模型？ |
-| 第 11–13 节：Runtime 与异步 | self、配置对象、接入方法和 await 分别做什么？ |
-| 第 14–17 节：逐段读 Day 1 | 三个核心函数与异常收尾为什么这样写？ |
-| 第 18–20 节：文件地图、速查和依据 | 遇到陌生名字时去哪里找？ |
+## 阅读方式：先认对象，再读执行过程
+
+各天文档的代码前已补上“类是什么、属性是什么意思、函数接收什么并返回什么”的对照表。公共的消息类、ModelIO、Runtime、RunOptions、ToolExecution、ReadArgs、JsonStore 统一见 [基础代码对象说明](support.md#先认识基础代码中的类与函数)，各天新增的类在当天说明。
+
+看到 `class` 时，先分清它保存数据、管理行为，还是表示异常；看到 `self.xxx` 时，它是当前实例的属性；函数体中的普通变量通常只在这次调用中使用。`type X = ...` 是类型别名，不代表创建了一个新类。`@property` 定义的计算属性读作 `obj.value`；一般方法写作 `obj.method(...)`。
+
+函数要连着三件事读：谁传入参数，函数内做什么，谁使用返回值。尤其是回调：`check_path` 是函数对象，注册只保存它；`check_path(context)` 得到协程对象，`await check_path(context)` 才取得 return 的数据。具体例子见 [Hook 讲解](hooks-explained.md#9-invoke-的实际回调与逐分支解释)。
 
 ## 1. 先分清：哪些是 Python，哪些是包，哪些是我们自己的代码
 
 ### 1.1 包、模块和 import
 
-看这一行：
-
 ```python
-from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+# ruff: noqa: F401  # 仅展示消息类的导入写法。
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 ```
 
-可以从左到右读成：从 `pydantic_ai` 包中的 `messages` 模块，取出三个已经定义好的名字，供当前文件使用。
+从 `langchain_core` 包的 messages 模块导入三个消息类。导入只让当前文件能使用这些名字，不会请求模型或执行工具。安装包名 `langchain-core` 和导入名 `langchain_core` 不同，和 python-dotenv / dotenv 类似。
 
-- **包**：组织多个 Python 模块的单位，这里叫 `pydantic_ai`。
-- **模块**：通常对应一个 `.py` 文件，这里对应安装目录里的 `pydantic_ai/messages.py`。
-- **类**：定义一种对象有哪些数据、能做什么。这里三个名字都是类。
-- **导入**：让当前文件能使用这个名字。导入类不等于请求模型，也不等于执行工具。
+基础请求使用 `from langchain_openai import ChatOpenAI`。添加 langchain-openai 会带入其需要的 Core 和 SDK 依赖；我们不使用 LangChain 的 create_agent 来运行循环。
 
-项目依赖里叫 `pydantic-ai-slim`，代码却写 `import pydantic_ai`，是因为“安装包名称”和“Python 导入名称”可以不同。`python-dotenv` 对应 `dotenv` 也是一样。
+### 1.2 Day 1 的几类来源
 
-### 1.2 Day 1 的三类来源
-
-| 来源 | 例子 | 负责什么 |
+| 来源 | 例子 | 职责 |
 | --- | --- | --- |
-| Python 自带的标准库 | `asyncio`、`logging`、`pathlib`、`dataclasses`、`collections.abc`、`typing`、`copy`、`math` | 异步等待、日志、路径、类型表达、对象复制等基础能力 |
-| 第三方 Pydantic | `BaseModel`、`Field`、`ConfigDict`、`ValidationError` | 声明并校验数据，例如 read 的参数必须有字符串 `path` |
-| 第三方 PydanticAI | `ModelRequest`、`ModelResponse`、各种 `Part`、`model_request`、`ToolDefinition` | 描述模型消息和工具协议，完成单次模型通信 |
-| Zeta 自己定义的代码 | `response_calls`、`validate_history`、`run_loop`、`Runtime`、`RunLimitError` | 决定何时请求、何时执行工具、怎样配对、何时停止 |
+| Python 标准库 | asyncio、logging、pathlib、dataclasses、typing、copy | 异步、日志、文件、类型与复制 |
+| Pydantic | BaseModel、Field、ValidationError | ReadArgs 和业务记录的校验，仍然保留 |
+| LangChain Core | BaseMessage、AIMessage、ToolMessage、ToolCall | 消息结构、工具调用结构 |
+| LangChain OpenAI 兼容接口 | ChatOpenAI | 一次模型通信 |
+| 底层模型 SDK | APIStatusError、APIError | HTTP 和连接错误 |
+| Zeta | Runtime、response_calls、validate_history、run_loop | 循环、配对、工具执行和停止决策 |
 
-`from zeta.loop_common import RunLimitError` 表示导入我们自己文件里的名字。它不是 PydanticAI 自带的异常。
-
-**Pydantic 和 PydanticAI 是两个不同的包。** 参数校验用前者，模型通信和消息类型用后者。Zeta 使用 PydanticAI 的 direct API 发送一次请求，后续循环由自己的 `run_loop` 控制。
+Pydantic 与 PydanticAI 是不同依赖。此次替换 PydanticAI，保留 Pydantic 参数校验。`ModelResponseError` 是 Zeta 在 loop_common.py 提前提供的异常类，用于拒绝不完整响应。
 
 ## 2. 读这些代码需要的最小 Python 语法
 
-### 2.1 类、对象、属性、方法分别是什么
-
-下面这个片段创建一个工具调用对象：
+### 2.1 类、对象、属性、字典键分别是什么
 
 ```python
-from pydantic_ai.messages import ToolCallPart
+from langchain_core.messages import AIMessage, ToolCall
 
-call = ToolCallPart(
-    tool_name="read",
-    args={"path": "README.md"},
-    tool_call_id="call_001",
+call: ToolCall = {"name": "read", "args": {"path": "README.md"}, "id": "call_001"}
+response = AIMessage(
+    content="先读取文件。",
+    tool_calls=[call],
+    response_metadata={"finish_reason": "tool_calls"},
 )
 ```
 
-逐项解释：
+`AIMessage` 是类，`response` 是它的实例。`response.tool_calls` 是对象属性；`call` 则是字典，`call["name"]` 读取字典键。这两种访问方式不能混用。
 
-| 写法 | 含义 | 在这个例子里的值 |
-| --- | --- | --- |
-| `ToolCallPart` | 类，规定工具调用的数据形状 | 不是某一次具体调用 |
-| `ToolCallPart(...)` | 调用构造入口，创建一个实例 | 得到一个工具调用对象 |
-| `call` | 保存这个对象的变量名 | 名字可以换，但这里约定叫 call |
-| `call.tool_name` | 读取对象的属性 | `"read"` |
-| `call.args` | 读取参数属性 | `{"path": "README.md"}` |
-| `call.tool_call_id` | 读取编号属性 | `"call_001"` |
-| `call.args_as_dict()` | 调用对象提供的方法 | 将参数按字典形式返回 |
+ToolCall 是 TypedDict 类型约定，不是一个带 tool_name、args_as_dict 方法的框架对象。不要用 isinstance(call, ToolCall) 做运行时检查；参数正确性仍由 ReadArgs 校验，完整响应由 response_calls 检查。
 
-有圆括号的 `call.args_as_dict()` 是方法调用。没有圆括号的 `call.tool_call_id` 是属性访问。不能写 `call.tool_call_id()`，因为字符串不能被当作函数调用。
-
-`ToolCallPart(...)` 里带括号也不意味着执行 read：这里调用的是**对象构造入口**。构造出的对象只是在描述“请调用 read”。
-
-还有一种属性叫 `property`，读取时会执行类内部的计算。`response.text` 就属于这种情况，但使用者仍然写 `response.text`，不写 `response.text()`。
+`AIMessage(...)` 创建消息对象，不执行 read。`response.text` 是属性，返回文字，不写 response.text()。本课程只接收普通字符串 content，多模态内容块留待后续扩展。
 
 ### 2.2 字符串、列表、字典和 None
 
@@ -103,591 +82,205 @@ call = ToolCallPart(
 
 `parts[0]` 取序列的第一个元素；Python 索引从 0 开始。`args["path"]` 则通过字典的键取值。这两种方括号访问不是一回事。
 
-对象属性用点号，例如 `call.tool_name`。字典取值用键，例如 `call.args["path"]`，但这句只有在 `args` 已确认是字典时才适用。
+对象属性用点号，例如 `response.tool_calls`。调用字典用键，例如 `call["name"]` 和 `call["args"]["path"]`；后者仍需先通过 ReadArgs 校验。
 
-### 2.3 类型注解不负责执行，也不自动校验所有数据
+### 2.3 类型注解不负责自动执行或校验
 
-```python
-from collections.abc import Sequence
+`response: AIMessage` 表示这个参数应当是 AIMessage；`list[ToolCall]` 表示由调用字典组成的列表。类型提示不会自动发请求，也不保证模型返回值合法，所以仍要写 response_calls 和 validate_history。
 
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-
-
-def response_calls(response: ModelResponse) -> list[ToolCallPart]:
-    """签名阅读示例：函数体见 Day 1。"""
-    raise NotImplementedError
-
-
-def validate_history(messages: Sequence[ModelMessage]) -> None:
-    """签名阅读示例：函数体见 Day 1。"""
-    raise NotImplementedError
-```
-
-这里只读签名，不需要把这两个未完成函数另外复制到源码。
-
-- `response: ModelResponse`：这个参数预期是一个 `ModelResponse` 对象。
-- `-> list[ToolCallPart]`：正常返回时，结果是一个列表，列表里的元素都是 `ToolCallPart`。
-- `Sequence[ModelMessage]`：一个有顺序的消息序列，可以是列表、元组等；这个接口只要求读取，不要求一定是可修改的列表。
-- `-> None`：函数不返回有用的数据。校验成功正常结束，校验失败抛异常。
-- `str | None`：允许字符串或者 `None`。
-- `dict[str, str]`：键和值都是字符串的字典。
-
-**类型注解主要供人和类型检查器使用。** 写了 `path: str` 不代表普通 Python 函数会自动阻止所有错误输入。`ReadArgs.model_validate(...)` 才是明确执行 Pydantic 运行时校验的操作。
+`Sequence[BaseMessage]` 表示可以按顺序读取的消息序列；调用者可传列表，函数不要求它提供 append。需要修改自己的历史时，Runtime 使用 list[BaseMessage]。
 
 ### 2.4 后面会反复出现的短写法
 
-| 表达式 | 用普通话解释 |
+| 写法 | 意思 |
 | --- | --- |
-| `isinstance(part, ToolCallPart)` | part 是不是 ToolCallPart 类型的实例，包括它的子类实例？ |
-| `if calls:` | calls 列表是否非空？ |
-| `if not calls:` | calls 列表是否为空？ |
-| `value.strip()` | 返回去掉两端空白后的字符串，不修改原字符串 |
-| `len(ids)` | 列表中有多少个元素？ |
-| `set(ids)` | 用集合去除重复编号，不用它保持原顺序 |
-| `any(...)` | 里面有没有至少一个条件为真？ |
-| `response.text or ""` | text 为 None 或空字符串等假值时，使用空字符串 |
-| `pending.get(key)` | 查字典；没有这个键时默认返回 None |
-| `del pending[key]` | 从字典删除这个键和值 |
-| `history.append(response)` | 把整个 response 作为一个元素放到列表末尾 |
-| `continue` | 跳过本轮后续代码，进入下一轮循环 |
-| `raise SomeError(...)` | 抛出异常，普通执行流程在这里中断 |
+| `isinstance(message, AIMessage)` | 判断是不是模型消息对象 |
+| `[call["id"] for call in calls]` | 从每个调用取编号，形成新列表 |
+| `any(...)` | 只要有一个条件成立就为真 |
+| `len(ids) != len(set(ids))` | 去重前后长度不同，说明有重复 |
+| `value or ""` | value 为空或 None 时取空字符串 |
+| `raise ValueError(...)` | 抛出异常，中断普通执行路径 |
+| `return calls` | 把列表交还给调用方 |
+
+LangChain 的调用 ID 类型允许 None，但 Zeta 的 response_calls 会拒绝空编号。下游 `call["id"] or ""` 是在这项校验之后满足类型检查的写法，不是为缺失编号补造值。
 
 ## 3. 模型通信不是“输入一个字符串，输出也只有一个字符串”
 
-用户界面看起来像聊天，但程序需要处理更丰富的数据。模型可能输出普通文字，也可能请求程序读取文件；程序随后要把读取结果发回去。
+一次响应可能是最终文字，也可能包含工具调用。单次 ainvoke 只负责把请求交给服务商并取回 AIMessage。文件读取发生在 Zeta 的 execute_tool，不发生在 bind_tools 或 ainvoke 里。
 
-PydanticAI 用两类消息承载这些数据：
+因此必须保存完整 AIMessage，再保存对应 ToolMessage。只保存 response.text 会丢失调用编号、参数、结束原因和用量信息，下一轮无法正确接续。
 
-| 消息类 | 方向 | 典型内容 |
+## 4. content 与 tool_calls：先看对象里面的层次
+
+### 4.1 先认识常用消息类型
+
+| 类型 | 代表谁的消息 | 主要数据 |
 | --- | --- | --- |
-| `ModelRequest` | 程序交给模型的消息 | 用户的问题、工具执行结果等 |
-| `ModelResponse` | 模型返回给程序的消息 | 文字、工具调用等 |
+| SystemMessage | 可信指令 | content |
+| HumanMessage | 用户输入或明确标注的参考资料 | content |
+| AIMessage | 模型响应 | content、tool_calls、response_metadata |
+| ToolMessage | 一次工具的结果 | content、tool_call_id、name、status |
+| BaseMessage | 这些消息的公共父类 | 便于描述混合消息列表 |
 
-`ModelMessage` 是表示“可以是上述两种消息之一”的类型别名。Day 1 可按 `ModelRequest | ModelResponse` 理解；源码还附带了序列化时用的类型区分信息。它不是要你写 `ModelMessage(...)` 来创建对象的第三种消息类。
-
-**`ModelRequest` 不等于“一次 HTTP 请求”，也不等于“只能装用户说的话”。**
-
-一次 `model_request(model, history, ...)` 通信会把整个历史序列交给适配器。这个序列中既有以前的 `ModelRequest`，也有以前的 `ModelResponse`。适配器再转换成服务商需要的请求格式。
-
-例如第二次调用模型时，输入历史可以有三条消息：
-
-```text
-history[0]：ModelRequest   用户要求读取 README.md
-history[1]：ModelResponse  模型要求调用 read
-history[2]：ModelRequest   程序提供 read 的读取结果
-```
-
-这三条消息共同构成第二次请求的输入。模型需要看到它自己之前要求做什么，以及程序实际得到什么结果。
-
-## 4. parts 到底是什么？先看对象里面的层次
-
-`parts` 就是英文“多个部分”。一条消息内部可能含多个部分，所以消息对象有一个叫 `parts` 的属性。
-
-```text
-history：外层消息序列
-  第 0 条消息：ModelRequest
-    parts：这条消息内部的片段序列
-      第 0 个片段：UserPromptPart
-  第 1 条消息：ModelResponse
-    parts：这条消息内部的片段序列
-      第 0 个片段：TextPart
-      第 1 个片段：ToolCallPart
-```
-
-**两层序列不要混淆：`history` 里面是消息，`message.parts` 里面是片段。**
-
-`parts` 的类型声明是 `Sequence[...]`，常见构造形式是列表 `[...]`；它不是一个固定内容的字符串，也不保证只有一个元素。不同片段有不同字段，不是每个片段都有 `content`，也不是每个片段都有 `tool_name`。
-
-### 4.1 先认识四种最常用的 Part
-
-| 类 | 可以拆成 | 含义 | Day 1 中放在哪一侧 | 最重要的属性 |
-| --- | --- | --- | --- | --- |
-| `UserPromptPart` | User + Prompt + Part | 用户输入片段 | `ModelRequest.parts` | `content` |
-| `TextPart` | Text + Part | 模型文字片段 | `ModelResponse.parts` | `content` |
-| `ToolCallPart` | Tool + Call + Part | 模型要求调用工具 | `ModelResponse.parts` | `tool_name`、`args`、`tool_call_id` |
-| `ToolReturnPart` | Tool + Return + Part | 程序返回工具结果 | `ModelRequest.parts` | `tool_name`、`content`、`tool_call_id`、`outcome` |
-
-普通用户定义工具的调用和返回方向就是上表。包里还有 `ThinkingPart`、原生工具片段、多模态片段等；Day 1 不需要全部掌握，也不能据此假定整个包只有这四种类型。特别是服务商原生工具有自己的返回片段类型，不要与本地 read 使用的 `ToolReturnPart` 混为一谈。
+ToolCall 不是独立消息。它放在 AIMessage.tool_calls 列表里，描述待执行的调用。
 
 ### 4.2 只有文字的响应
 
-下面是一个便于阅读的对象示例：
-
 ```python
-from pydantic_ai.messages import ModelResponse, TextPart
+from langchain_core.messages import AIMessage
 
-response = ModelResponse(
-    parts=[TextPart(content="你好，我是 Zeta。")],
-    state="complete",
-    finish_reason="stop",
+response = AIMessage(
+    content="项目目标是实现自己的 Agent 核心。",
+    response_metadata={"finish_reason": "stop"},
 )
 ```
 
-各表达式的值为：
-
-| 表达式 | 值 |
-| --- | --- |
-| `response.parts` | 包含一个 TextPart 对象的序列 |
-| `response.parts[0]` | `TextPart(content="你好，我是 Zeta。")`，这里省略默认字段 |
-| `response.parts[0].content` | `"你好，我是 Zeta。"` |
-| `response.text` | `"你好，我是 Zeta。"` |
-| `response.state` | `"complete"` |
-| `response.finish_reason` | `"stop"` |
-
-`response.parts[0]` 是对象，`response.parts[0].content` 才是这个文字对象保存的字符串。
+此时 response.tool_calls 是空列表；response.text 得到回答文字。
 
 ### 4.3 只有工具调用的响应
 
 ```python
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from langchain_core.messages import AIMessage
 
-response = ModelResponse(
-    parts=[
-        ToolCallPart(
-            tool_name="read",
-            args={"path": "README.md"},
-            tool_call_id="call_001",
-        )
-    ],
-    state="complete",
-    finish_reason="tool_call",
+response = AIMessage(
+    content="",
+    tool_calls=[{"name": "read", "args": {"path": "README.md"}, "id": "call_001"}],
+    response_metadata={"finish_reason": "tool_calls"},
 )
 ```
 
-这次 `response.parts[0]` 是 `ToolCallPart`。它的意思是：希望程序执行名为 read 的工具，参数是 path=README.md，这次调用编号是 call_001。
-
-此时 `response.text` 是 **`None`**，因为没有文字片段。工具调用是真实的结构化内容，即使 `response.text` 为空也不能直接认定“模型没有返回任何东西”。
+空 content 在有合法调用时允许。它只是要求 read，此刻文件尚未读取。
 
 ### 4.4 文字和工具调用同时存在
 
-```python
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
-
-response = ModelResponse(
-    parts=[
-        TextPart(content="我先读取项目说明。"),
-        ToolCallPart(
-            tool_name="read",
-            args={"path": "README.md"},
-            tool_call_id="call_001",
-        ),
-    ],
-    state="complete",
-    finish_reason="tool_call",
-)
-```
-
-`response.text` 只能拿到 `"我先读取项目说明。"`。如果只保留它，就丢掉了工具名称、参数、调用编号，也就无法执行和配对了。
-
-所以 Day 1 会遍历 `response.parts`，找出其中的 `ToolCallPart`。**有文字不代表任务已经结束，要先看有没有工具调用。**
-
-在本地 2.37.0 中，`response.text` 是根据文字片段计算出来的便捷属性：相邻文字片段拼接，隔着其他片段的文字段之间使用空行分隔；也可包含语音转写文字。Day 1 只需理解它是文字视图，不能替代完整 `parts`。
+content 可以是“我先检查 README”，tool_calls 同时包含 read 调用。有调用时循环继续执行工具，不把这段过渡文字当最终答案。
 
 ### 4.5 为什么先判断类型再读属性
 
-同一个 `parts` 序列里可以混合多种对象。只有确认片段属于工具调用，才读取工具调用的字段。
-
-```python
-from pydantic_ai.messages import ModelResponse, ToolCallPart
-
-
-def describe_calls(response: ModelResponse) -> list[str]:
-    """语法讲解：只描述调用，不执行工具，不属于新增练习。"""
-    descriptions: list[str] = []
-    for part in response.parts:
-        if isinstance(part, ToolCallPart):
-            descriptions.append(f"{part.tool_call_id}: {part.tool_name}")
-    return descriptions
-```
-
-上面的 `isinstance` 同时帮助人和类型检查器缩小范围：进入 `if` 后，就知道 `part` 可以按 `ToolCallPart` 读取。这也叫类型收窄。
+历史是 list[BaseMessage]。AIMessage 才有 tool_calls；ToolMessage 才有 tool_call_id。先用 isinstance 区分消息，再读取相应字段。不要在 HumanMessage 上遍历不存在的 parts，也不要把所有消息都当工具结果。
 
 ## 5. tool_call_id：给“这一次调用”配对，不是给工具命名
 
-### 5.1 tool_name 和 tool_call_id 的区别
+### 5.1 name 和 id 的区别
 
-假设模型同一轮想读两个文件：
-
-| 调用 | `tool_name` | `args` | `tool_call_id` |
-| --- | --- | --- | --- |
-| 第一次 | `"read"` | `{"path": "README.md"}` | `"call_001"` |
-| 第二次 | `"read"` | `{"path": "pyproject.toml"}` | `"call_002"` |
-
-两个调用的工具名称相同。只写 `tool_name="read"` 无法说明“这份结果对应哪一个文件的调用”。不同编号用来区分每一次调用。
-
-可以把工具名称理解为操作种类，把调用编号理解为这笔操作的单号。编号不是文件路径、不是函数名，也不是整个会话的编号。
+两次 read 的 name 都可以是 read，但必须有不同调用 ID。编号来自模型响应，在本地执行器、Hooks、Session 和下一次模型请求中保持不变。
 
 ### 5.2 编号从哪里来
 
-真实模型调用中，服务商返回的工具调用数据通常带有编号，PydanticAI 将它保存在 `ToolCallPart.tool_call_id`。包也有缺少编号时的生成机制，手动构造对象时不填该字段会触发默认生成。
-
-**对 Zeta 而言，拿到 `call.tool_call_id` 后应原样使用，不要解析前缀，也不要自己重新生成结果编号。** 本文的 `call_001` 只是易读示意，不要求真实 ID 长这样。
-
-尤其不要因为 `ToolReturnPart` 也能自动生成编号，就省略返回对象上的编号。它自动生成的新编号不保证与原调用相同。
+LangChain 在 response.tool_calls 中提供 id。Zeta 检查它非空、同批唯一；执行结果沿用这个编号。不能用文件名替换，也不能为错误结果另造一个编号。
 
 ### 5.3 正确配对的结果对象
 
 ```python
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+from langchain_core.messages import ToolMessage
 
-call = ToolCallPart(
-    tool_name="read",
-    args={"path": "README.md"},
+result = ToolMessage(
+    name="read",
     tool_call_id="call_001",
-)
-
-result = ToolReturnPart(
-    tool_name=call.tool_name,
-    tool_call_id=call.tool_call_id,
-    content="# Zeta\n一个本地 Coding Agent。",
+    content="这里是实际读取到的正文。",
+    status="success",
 )
 ```
 
-这里的 `content` 是讲解用正文。在实际 `execute_tool` 中，这个参数来自 `read_file(...)` 的返回值。
+这里 name 是 Zeta 额外保留的工具名，校验时和 pending 记录一起核对；服务商主要通过 tool_call_id 关联调用与结果。
 
-匹配关系是：
+## 6. ToolMessage 是结果信封，Python return 是语言动作
 
-```text
-调用：tool_name="read", tool_call_id="call_001"
-结果：tool_name="read", tool_call_id="call_001"
-```
+`ToolMessage(...)` 是构造结果消息；`return result` 是把这个对象交给当前函数的调用者。两者都不等于已经发送给模型。
 
-`content` 可以变化，它承载结果；名称和编号必须对应原调用。
+Day 1 的链条是：read_file 返回正文字符串 → execute_tool 返回 ToolMessage → Runtime.execute 返回 ToolExecution → 循环收集 execution.result → Runtime.after_turn 把这些 ToolMessage 追加到历史 → 下一次请求才发出去。
 
-Day 1 校验非空、同批编号不重复，并按编号与名称检查结果。编号只满足这些条件并不证明工具真的执行了，也不证明结果内容正确；那还要看实际执行过程。
+ToolExecution 是 Zeta 自己的记录，包含 raw 和 result；它不是 LangChain 消息，不直接发送。
 
-## 6. ToolReturnPart 是结果信封，Python return 是语言动作
-
-名字里的 Return 很容易让人误会。看实际工具代码的形状：
-
-```text
-return ToolReturnPart(
-    tool_name=call.tool_name,
-    tool_call_id=call.tool_call_id,
-    content=read_file(args, workspace),
-)
-```
-
-执行顺序是：
-
-1. 先调用 `read_file(args, workspace)`，得到文件正文字符串；失败时会抛异常。
-2. 用正文、名称和编号创建 `ToolReturnPart` 对象。
-3. Python 的 `return` 把这个对象交给 `execute_tool` 的调用者。
-
-`return` 是 Python 关键字；`ToolReturnPart` 是类；`content` 是构造参数和对象属性。它们属于三个层面。
-
-结果对象本身不会自动发送到模型。Day 1 还要把结果放进 `ModelRequest(parts=results, ...)`，加入历史，然后再请求一次模型。
-
-本地版本中常见字段如下：
-
-| 字段 | 类型/典型值 | 作用 |
-| --- | --- | --- |
-| `tool_name` | `str`，例如 `"read"` | 对应哪个工具 |
-| `tool_call_id` | `str`，例如 `"call_001"` | 对应哪一次调用 |
-| `content` | Day 1 是文件正文字符串；库还支持更丰富内容 | 把什么结果告诉模型 |
-| `outcome` | `"success"` / `"failed"` / `"denied"` / `"interrupted"` | 本次工具处理结果，默认 success |
-| `part_kind` | `"tool-return"` | 标识片段种类，通常不用自己填 |
-| `timestamp` | 时间对象 | 结果记录时间，有默认值 |
-| `metadata` | 可选附加数据 | 本地附加信息，不作为这个字段直接发送给模型 |
-
-Day 1 的基础 `execute_tool` 成功时返回结果，预期失败时抛出 `ToolError` 并停止。Day 2 才增加把预期失败和拒绝转换为结果对象的调度逻辑。不要仅因为库支持 `outcome="failed"`，就以为 Day 1 已经实现了失败后继续。
-
-## 7. 走一遍完整历史：用户提问 → 工具调用 → 工具结果 → 最终回答
-
-设用户要求：**“用 read 读取 README.md 并概括目标。”**
+## 7. 完整历史：用户提问 → 工具调用 → 工具结果 → 最终回答
 
 ### 7.1 第一步：创建用户消息
 
-```python
-from pydantic_ai.messages import ModelRequest
-
-request = ModelRequest.user_text_prompt(
-    "用 read 读取 README.md 并概括目标。",
-    instructions="You are Zeta. Use read for file questions.",
-)
-```
-
-`user_text_prompt` 是 `ModelRequest` 提供的类方法，用来方便地创建用户文字消息。在这个版本中，它相当于构造：
-
-```python
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-
-request = ModelRequest(
-    parts=[UserPromptPart(content="用 read 读取 README.md 并概括目标。")],
-    instructions="You are Zeta. Use read for file questions.",
-)
-```
-
-上面两段是两种等价写法，不是让你往历史里添加两次。
-
-`instructions` 是程序给模型的行为要求；用户问题在 `UserPromptPart.content`。read 的文件正文随后属于工具结果内容。数据来自文件，不会因为被拼进消息就获得程序指令的权限。
-
-此时历史只有一条：
-
-```text
-[用户消息]
-```
+Runtime.start 将 HumanMessage(content=prompt) 加入 history。固定指令由 Runtime.prepare 放入本轮视图中的 SystemMessage，不在 Session 每条原始记录里重复存一份。
 
 ### 7.2 第二步：发出第一次模型请求
 
-`run_loop` 经由 `runtime.io.request(...)` 调用 `request_once(...)`，它再调用 PydanticAI 的 `model_request(...)`。
-
-输入包括历史和工具定义。假设响应是第 4.3 节那样的工具调用，循环会把完整 `ModelResponse` 加入历史：
-
-```text
-[用户消息, 模型工具调用消息]
-```
-
-模型只是要求读文件，文件还没有被读取。文字“我读完了”也不等于工具执行记录。
+循环依次调用 begin_turn、prepare、validate_history，再 await runtime.io.request。prepare 返回 SystemMessage 加历史副本，request_once 附带 read 工具定义，调用 LangChain ainvoke，取得 AIMessage。
 
 ### 7.3 第三步：执行本地工具
 
-程序检查调用、预算和参数，再执行 `read_file`。假设成功，得到带 `call_001` 的 `ToolReturnPart`。
-
-`runtime.on_result(execution)` 先记录执行对象，`runtime.after_turn(results)` 再把本批结果包装成一条请求消息：
-
-```text
-ModelRequest(
-    parts=[ToolReturnPart(tool_name="read", tool_call_id="call_001", content=正文)],
-    instructions=INSTRUCTIONS,
-)
-```
-
-此时历史为：
-
-```text
-[用户消息, 模型工具调用消息, 程序工具结果消息]
-```
-
-**ToolReturnPart 放在 ModelRequest 一侧。** 因为这是程序提供给模型的输入，哪怕内容不是用户亲自写的。
+response_calls 检查响应，on_response 保存整条 AIMessage。执行器检查 ReadArgs、路径和文件大小，返回同编号的 ToolMessage。工具结果在 after_turn 通过 history.extend(results) 加入历史。
 
 ### 7.4 第四步：发出第二次模型请求
 
-把上述三条消息一起送给模型。模型看到原始问题、它发起的工具调用、对应的读取结果，才有依据生成回答。
-
-假设这次得到只有 `TextPart` 的完整响应，循环把它加入历史，最终返回文字：
-
 ```text
-[用户消息, 模型工具调用消息, 程序工具结果消息, 模型最终文字消息]
+模型输入视图：
+SystemMessage(固定指令)
+HumanMessage(用户问题)
+AIMessage(tool_calls=[read, id=call_001])
+ToolMessage(正文, tool_call_id=call_001)
 ```
 
-两次请求是同一个 `run_loop` 的两轮，不需要写两个 `run_agent`。
+第二次请求才包含文件正文。模型这次给出无调用的完整 AIMessage 时，循环返回 response.text。
 
 ### 7.5 一轮有多个调用时
 
-如果一个响应里有两个 `ToolCallPart`，Day 1 先执行两个调用，把两个结果收集到 `results`，然后加入同一条 `ModelRequest`：
+一条 AIMessage 可以要求多个 read，每个调用各有一条 ToolMessage。LangChain 不要求把工具结果重新包进请求消息；按顺序追加独立 ToolMessage 即可，但下次请求前整批必须配齐。
 
-```text
-ModelResponse.parts = [read 调用 call_001, read 调用 call_002]
-ModelRequest.parts  = [read 结果 call_001, read 结果 call_002]
-```
+## 8. 完整消息与 finish_reason：怎样判断响应能否使用
 
-在 Day 1 的实现里，这两个工具通过 `for` 逐个执行，**没有并发执行**。必须补齐这一批调用的结果，才允许发起下一次模型请求。
+### 8.1 LangChain 没有这里可用的 response.state
 
-## 8. response.state 和 finish_reason：两个问题，两套值
+本课用非流式 ainvoke 取得完整 AIMessage；AIMessageChunk 属于流式片段，明确拒绝执行。invalid_tool_calls 非空说明有无法解析的工具参数，也拒绝整次响应，不能忽略坏调用只执行剩余部分。
 
-这两个属性非常容易写混，应该分开问：
+### 8.2 finish_reason 在 response_metadata 中
 
-- `state`：这个响应对象处于什么完成状态？
-- `finish_reason`：模型这一轮生成为什么结束？
-
-### 8.1 本地 2.37.0 的 state
-
-| 值 | 含义 | Day 1 如何处理 |
-| --- | --- | --- |
-| `"complete"` | 这一份响应已完成 | 再检查结束原因和内容 |
-| `"incomplete"` | 响应尚未完整，例如流式途中或提前停止 | 拒绝执行工具 |
-| `"suspended"` | 模型暂停，期待后续继续 | 当前简单循环没有实现这类续传，拒绝 |
-| `"interrupted"` | 生成被显式中断 | 拒绝 |
-
-`state` **没有 `"stop"` 这个合法值**。
-
-### 8.2 本地 2.37.0 的 finish_reason
-
-| 值 | 含义 | Day 1 如何处理 |
-| --- | --- | --- |
-| `"stop"` | 模型正常结束本轮生成 | 检查工具调用；无调用时还要求非空文字 |
-| `"tool_call"` | 本轮结束于工具调用 | 提取并验证调用 |
-| `"length"` | 生成触及长度限制 | 拒绝，不能用可能截断的参数执行工具 |
-| `"content_filter"` | 因内容过滤结束 | 拒绝 |
-| `"error"` | 以错误原因结束 | 拒绝 |
-| `None` | 没有提供结束原因 | 当前 Day 1 保守拒绝 |
-
-这些是 PydanticAI 归一化后的值，不要求与服务商原始 JSON 的字符串完全一致。例如不要把别处见到的 `"tool_calls"` 直接当成这里的 `"tool_call"`。
-
-常见正常组合：
-
-```text
-完整文字回答：state="complete", finish_reason="stop"
-完整工具调用：state="complete", finish_reason="tool_call"
-```
-
-**一份响应完整，不表示整个用户任务已经完成。** 工具调用响应可以是 complete，但 Agent 还要执行工具和请求下一轮。反过来，拿到响应对象也不保证内容适合执行，仍需要检查原因、参数与编号。
-
-### 8.3 对照你当前练习中的写法
-
-阅读本文时，如果你的 `response_calls` 仍写着：
-
-```text
-response.state != "stop"
-```
-
-这里应该检查的是 `"complete"`。否则正常响应的 state 为 complete，也会被判为不完整。Day 1 参考答案使用的是 complete。
-
-这是属性取值的纠正，不需要换一套函数或重写循环。本次前置知识文档不会修改你的练习源码。
-
-## 9. 模型怎么知道有 read？ToolDefinition 与真正执行工具的区别
-
-模型不会自动知道本机存在 `read_file` 函数。程序需要先描述可以用什么工具，以及每个工具接受什么参数。
-
-现有 `tools.py` 有三层：
-
-| 层 | 名字 | 做什么 |
-| --- | --- | --- |
-| 参数规则 | `ReadArgs` | read 必须接收怎样的数据 |
-| 给模型看的说明 | `ToolDefinition` / `TOOL_DEFINITIONS` | 告诉模型有一个名为 read 的工具及参数格式 |
-| 真正执行 | `execute_tool` → `read_file` | 检查名称和参数，读取本地文件，创建返回对象 |
-
-**给出 ToolDefinition 不会自动运行 Python 函数。** 在 Zeta 使用的 direct API 路线里，执行动作由我们自己的循环发起。
-
-### 9.1 ReadArgs 和 Pydantic
-
-```python
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class ReadArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    path: str = Field(min_length=1, description="UTF-8 file path inside the workspace")
-```
-
-这是现有参数模型的核心结构：
-
-- `BaseModel`：Pydantic 的基类，继承后获得数据校验等能力。
-- `path: str`：预期有一个字符串字段 path。
-- `Field(min_length=1, ...)`：字符串至少一个字符；description 描述字段用途。
-- `extra="forbid"`：拒绝额外字段，例如模型无故加一个 `command`。
-- `strict=True`：启用严格校验，不应依靠宽松转换把错误类型凑成可用参数。
-
-`min_length=1` 不是文件安全检查：空格也占字符，路径是否存在、是否越界仍由 `read_file` 处理。
-
-### 9.2 args 为什么可能是字符串，也可能是字典
-
-下面两种形式表达的参数信息相同，但 Python 类型不同：
-
-```text
-字典：{"path": "README.md"}
-字符串：'{"path": "README.md"}'
-```
-
-第二种外层有引号，里面是 JSON 文本。真实适配结果或手动构造对象都可能采用不同表示；库的 `ToolCallPart.args` 类型允许 `str | dict[str, Any] | None`。
-
-因此 `execute_tool` 区分两条路径：
-
-| 调用 | 输入 | 成功结果 |
-| --- | --- | --- |
-| `ReadArgs.model_validate_json(call.args)` | JSON 字符串 | ReadArgs 对象 |
-| `ReadArgs.model_validate(call.args)` | Python 数据，例如字典 | ReadArgs 对象 |
-
-有了 ReadArgs 对象，就用 `args.path` 读取已经校验过的路径字段。非法 JSON、缺少 path、path 类型错误或多出字段会导致 `ValidationError`。
-
-`call.args_as_dict()` 是库提供的参数转换便捷方法，**不能替代 ReadArgs 对工具参数规则的校验**。本地版本默认还会宽容地包装某些坏 JSON；Day 1 执行工具使用上述明确的校验路径。
-
-### 9.3 model_json_schema() 是给模型看的结构说明
-
-`ReadArgs.model_json_schema()` 生成 JSON Schema，大致表达：
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "path": {"type": "string", "minLength": 1}
-  },
-  "required": ["path"],
-  "additionalProperties": false
-}
-```
-
-这是省略标题和描述字段后的结构示意，不是声称完整打印结果只有这些键。
-
-`ToolDefinition(name="read", ..., parameters_json_schema=...)` 把名称、描述和结构说明组合起来。`TOOL_DEFINITIONS` 是按名称保存这些定义的字典；`.values()` 取出定义对象，`list(...)` 把它们组成列表。
-
-工具定义中的 `strict=False` 与 `ReadArgs` 的 `strict=True` 控制不同层：前者涉及服务商工具 schema 的严格模式，后者是本地 Pydantic 数据校验。给模型的参数说明不会免除本地校验和权限检查。
-
-### 9.4 read_file 中暂时需要认识的标准库操作
-
-| 操作 | 在本项目中的用途 |
+| 情况 | 本课要求 |
 | --- | --- |
-| `Path(...)` / `Path.cwd()` | 表示路径 / 得到当前工作目录 |
-| `workspace.resolve(strict=True)` | 解析实际路径并要求路径存在 |
-| `root / args.path` | Path 重载的路径拼接，不是数字除法 |
-| `target.is_relative_to(root)` | 判断解析后的目标是否位于根目录内 |
-| `relative.parts` | **路径组件元组**，例如 `("src", "zeta", "tools.py")` |
-| `target.is_file()` | 是否为普通文件 |
-| `with target.open("rb") as file` | 用二进制模式打开文件，并在离开代码块时关闭 |
-| `file.read(MAX_READ_BYTES + 1)` | 多读一个字节来识别是否超过上限 |
-| `data.decode("utf-8")` | 将字节解码成正文字符串 |
+| 有 tool_calls | response_metadata["finish_reason"] 等于 `tool_calls` |
+| 无 tool_calls | finish_reason 等于 `stop`，且文字非空 |
+| length、缺少结束原因或其他值 | 拒绝执行，向外报错 |
 
-注意这里又出现了 `.parts`：**`Path.parts` 是路径的部分，`ModelResponse.parts` 是消息的部分。** 属性名字可以相同，实际含义由左边对象的类型决定。
+这里的 `tool_calls` 是服务商结束原因，不是旧框架的单数 `tool_call`。响应完整不代表任务已经结束，有合法工具调用时还需要循环。
 
-## 10. model_request、request_once、ModelRequest 为什么长得这么像
+### 8.3 对照你的函数
 
-这三个名字分别属于不同层：
+response_calls 同时检查消息形态、调用 ID 和结束原因。异常统一用 Zeta 的 ModelResponseError 表达。工具状态则属于 ToolMessage.status；运行状态属于 Runtime 的 RunStatus，不能相互混用。
 
-| 名字 | 种类 | 含义 |
-| --- | --- | --- |
-| `ModelRequest` | PydanticAI 类 | 一条输入消息的数据容器 |
-| `model_request` | PydanticAI 异步函数 | 发送一次模型请求并返回 ModelResponse |
-| `request_once` | Zeta 异步函数 | 为 model_request 配好本项目模型设置和工具定义 |
+## 9. 模型怎么知道有 read：工具说明与真正执行工具的区别
 
-真实调用关系是：
+### 9.1 ReadArgs 和 Pydantic 继续保留
 
-```text
-run_loop
-  调用 runtime.io.request
-    默认指向 request_once
-      调用 PydanticAI 的 model_request
-        通过模型适配器与服务商通信
-```
+ReadArgs 仍继承 BaseModel，path 使用 Field，ConfigDict(extra="forbid", strict=True) 拒绝多余字段与错误类型。换 LangChain 不要求你改写参数校验库。
+
+### 9.2 args 已由 LangChain 解析成字典
+
+`ReadArgs.model_validate(call["args"])` 校验工具参数。旧版根据字符串/字典选择 model_validate_json 的分支不再需要。解析 JSON 失败的调用会出现在 invalid_tool_calls，先由 response_calls 拒绝。
+
+### 9.3 model_json_schema() 仍是给模型看的结构说明
+
+TOOL_DEFINITIONS 现在用原生函数工具 schema 字典，function 中保存 name、description、parameters。parameters 仍来自 ReadArgs.model_json_schema()。
+
+model.bind_tools(list(TOOL_DEFINITIONS.values())) 仅把这些说明附到请求。它没有收到 read_file 的执行结果，也不代替本地 ReadArgs 校验、权限检查和读取。
+
+### 9.4 read_file 中的标准库操作不变
+
+Path.resolve 解析路径与符号链接，is_relative_to 检查工作区，is_file 检查普通文件；open("rb") 按字节读取，超过 32768 字节拒绝，最后用 UTF-8 解码。原版 read_file 的实现保留在 support，不在此另写一版。
+
+## 10. ainvoke、request_once 和消息类型分别是什么
 
 ### 10.1 模型对象是什么
 
-`create_model()` 返回 `OpenAIChatModel("deepseek-chat", provider="deepseek")`。
-
-- `"deepseek-chat"` 是模型名称。
-- `provider="deepseek"` 指明服务商配置。
-- `OpenAIChatModel` 是使用兼容 OpenAI Chat Completions 格式的模型适配类，类名不意味着这里请求 OpenAI 服务商。
-- 模型对象负责适配通信；创建对象可能进行配置检查，但不等于已经完成了一次模型生成。
-
-CLI 通过 `load_dotenv(override=False)` 加载本地 `.env` 配置，已有环境变量优先。本文不需要读取或展示你的密钥。
+ChatOpenAI 是 LangChain 的模型客户端。创建对象和 bind_tools 都不是执行 Agent；await requester.ainvoke(...) 才发一次模型请求。
 
 ### 10.2 一次请求的三个输入层次
 
-配套 `request_once` 调用中：
+| 内容 | 来自哪里 |
+| --- | --- |
+| 消息列表 | Runtime.prepare 或 ContextRuntime.prepare |
+| 工具说明 | request_once 提供 READ 工具 schema；摘要/规划/汇总为空 |
+| 模型与设置 | create_model 指定模型、超时、禁用自动重试和非思考模式；每次请求传 max_tokens |
 
-| 参数 | 例子 | 用途 |
-| --- | --- | --- |
-| `model` | create_model 返回的对象 | 找哪个模型、通过哪个服务商通信 |
-| `history` | `Sequence[ModelMessage]` | 模型本轮看到的历史内容 |
-| `model_settings` | timeout、max_tokens | 超时与生成长度等请求设置 |
-| `model_request_parameters` | ModelRequestParameters(...) | 工具定义等模型请求能力参数 |
+对外仍是 request_once(model, history, *, max_tokens=2048)。request_with_tools 只是接入内部共用的单次请求函数，不做工具调度或自动续跑。
 
-`function_tools` 是“这次允许模型请求调用哪些函数工具”的描述列表。它没有直接把函数体交给远程模型执行。
+### 10.3 response 还保存什么
 
-`max_tokens` 中的 token 是模型处理文本的计量单位，不等于一个汉字或一个英文单词；这个参数限制生成输出，不是请求次数，也不是整个 Agent 的全部费用上限。
-
-`model_request` 只完成一次请求。它返回 `ToolCallPart` 后，不会替 Zeta 自动执行 read 并完成后续循环。
-
-### 10.3 response 还有哪些暂时不用背的属性
-
-除了 parts、text、state、finish_reason，响应还有 `usage`、`model_name`、`timestamp`、服务商相关字段等。
-
-- `usage`：本次请求的用量对象，例如 `input_tokens`、`output_tokens`。手工构造对象有默认值，不能把默认值当成实际计费证据。
-- `model_name`：模型名称信息，可能为 None。
-- `timestamp`：响应记录时间。
-- `provider_response_id`：服务商响应编号，与某一次工具的 tool_call_id 不同。
-
-Day 1 不必全部处理，但保存完整 ModelResponse 可以保留这些信息。只保存文字会丢失结构和关联数据。
+response_metadata 保留结束原因等服务商元数据；usage_metadata 保留 input_tokens、output_tokens、total_tokens 等用量。未提供 usage 时是 None，不能伪造为真实的零用量。Day 8 沿用预留额度结算缺失用量的策略。
 
 ## 11. Runtime、self 和配置对象：读懂“点号接点号”
 
@@ -719,7 +312,7 @@ self.requests = 0
 | `workspace` | 解析后的 Path | 工具可访问的工作目录 |
 | `io` | ModelIO 对象 | 保存模型创建和请求函数 |
 | `options` | RunOptions 对象 | 保存次数、时限、输出额度 |
-| `history` | `[]` | 保存 ModelRequest / ModelResponse |
+| `history` | `[]` | 保存 HumanMessage / AIMessage / ToolMessage |
 | `executions` | `[]` | 保存工具执行记录 ToolExecution |
 | `requests` | `0` | 当前运行已尝试的模型请求次数 |
 | `tool_calls` | `0` | 当前运行已计入额度的工具调用数 |
@@ -755,8 +348,8 @@ request_once(...)         调用函数
 
 | 名字 | 读法 |
 | --- | --- |
-| `Callable[[], OpenAIChatModel]` | 不接收参数、返回模型对象的可调用对象 |
-| `Awaitable[ModelResponse]` | 可以 await，等待结果是 ModelResponse |
+| `Callable[[], AbstractAsyncContextManager[ChatOpenAI]]` | 不接收参数、返回异步上下文管理器的可调用对象 |
+| `Awaitable[AIMessage]` | 可以 await，等待结果是 AIMessage |
 | `Protocol` | 描述需要满足的接口形状，帮助类型检查 |
 | `RequestFn.__call__` | 规定 request 可调用对象应该接受哪些参数、返回什么 |
 | `Literal["completed", ...]` | 只允许列出的几个字面量值 |
@@ -768,7 +361,7 @@ request_once(...)         调用函数
 
 ### 11.5 Callable 和 Awaitable：函数、调用结果、等待后的结果
 
-正确拼写是 **`Callable`** 和 **`Awaitable`**。它们在这里从 Python 标准库 `collections.abc` 导入，不是 PydanticAI 独有的类型。
+正确拼写是 **`Callable`** 和 **`Awaitable`**。它们在这里从 Python 标准库 `collections.abc` 导入，不是 LangChain 独有的类型。
 
 **Callable 表示“可以调用的对象”。** 这里的“调用”指给对象加圆括号，例如 `create_model()`。普通函数、绑定方法，以及实现了 `__call__` 的对象都可以是可调用对象。
 
@@ -785,12 +378,12 @@ Callable[[参数1的类型, 参数2的类型], 调用后返回值的类型]
 | `Callable[[str], int]` | `fn("abc")` | 一个整数 |
 | `Callable[[int, int], int]` | `fn(2, 3)` | 一个整数 |
 | `Callable[[], str]` | `fn()` | 一个字符串 |
-| `Callable[[], OpenAIChatModel]` | `fn()` | 一个模型适配对象 |
+| `Callable[[], AbstractAsyncContextManager[ChatOpenAI]]` | `fn()` | 一个异步上下文管理器；进入后得到模型 |
 | `Callable[[str], Awaitable[str]]` | `fn("请概括这段内容")` | 一个可等待对象，成功 await 后才得到字符串 |
 
 例如 `Callable[[int, int], int]` 表示接收两个整数参数，不是接收一个含有两个整数的列表。空列表 `[]` 表示不需要传参数。
 
-**Awaitable[T] 表示“可以使用 await 等待，并在成功完成后得到 T 类型结果的对象”。** `T` 在这里是占位写法：换成 `str`，等待后得到字符串；换成 `ModelResponse`，等待后得到模型响应。
+**Awaitable[T] 表示“可以使用 await 等待，并在成功完成后得到 T 类型结果的对象”。** `T` 在这里是占位写法：换成 `str`，等待后得到字符串；换成 `AIMessage`，等待后得到模型响应。
 
 常见 Awaitable 包括协程对象、`asyncio.Task` 和 `asyncio.Future`。Day 1 主要接触调用 `async def` 函数得到的协程对象，不必先掌握另外两种的完整用法。
 
@@ -839,33 +432,33 @@ type SummaryFn = Callable[[str], Awaitable[str]]
 
 所以它们可以描述同一个异步函数，并不矛盾。不要为了匹配 Callable，把正常返回字符串的异步函数改成 `async def ... -> Awaitable[str]`；那会表达“等待结束后返回的值仍然是一个可等待对象”，与当前实现不同。
 
-`RequestFn.__call__` 使用普通 `def ... -> Awaitable[ModelResponse]` 描述接口，也是为了表达调用后直接得到可等待对象。它的函数体是 `...`，只声明接口；实际默认实现是 `request_once`。
+`RequestFn.__call__` 使用普通 `def ... -> Awaitable[AIMessage]` 描述接口，也是为了表达调用后直接得到可等待对象。它的函数体是 `...`，只声明接口；实际默认实现是 `request_once`。
 
 #### 对照 ModelIO 的三个字段
 
 | 字段 | 保存的默认函数 | 调用方式 | 成功取得的结果 |
 | --- | --- | --- | --- |
-| `factory` | `create_model` | `runtime.io.factory()` | 直接得到 OpenAIChatModel |
-| `request` | `request_once` | `await runtime.io.request(model, messages, max_tokens=2048)` | 等待后得到 ModelResponse |
+| `factory` | `create_model` | `runtime.io.factory()` | 得到异步上下文管理器；async with 进入后得到 ChatOpenAI |
+| `request` | `request_once` | `await runtime.io.request(model, messages, max_tokens=2048)` | 等待后得到 AIMessage |
 | `summarize` | `summarize_once` | `await runtime.io.summarize(prompt)` | 等待后得到 str |
 
-`factory()` 返回的模型对象可以用于 `async with` 管理资源，但这不意味着 `factory()` 本身要 await。**能够异步管理资源与能够被 await，是两种不同的接口能力。**
+`factory()` 返回的上下文管理器可以用于 `async with` 管理资源，但这不意味着 `factory()` 本身要 await。**能够异步管理资源与能够被 await，是两种不同的接口能力。**
 
 最后区分大小写：`Callable[...]` 用来写类型注解；Python 内置函数 `callable(obj)` 用来询问对象能否被调用，返回布尔值。后者不会验证参数签名和返回类型，也不会执行那个对象。
 
 ### 11.6 ToolExecution 又是什么
 
-`ToolExecution` 是 **Zeta 自己的 dataclass**，不是 PydanticAI 的另一种 Part：
+`ToolExecution` 是 **Zeta 自己的 dataclass**，不是 LangChain 的消息类：
 
 ```text
 ToolExecution
-  raw：工具原始结果 ToolReturnPart
-  result：最终采用的结果 ToolReturnPart
+  raw：工具原始结果 ToolMessage
+  result：最终采用的结果 ToolMessage
 ```
 
 Day 1 的两个字段内容相同，但 raw 使用深复制，保留独立对象。Day 2 有结果处理 Hook 后，才更需要区分原始结果与最终结果。
 
-因此 `execution.result` 是一个 ToolReturnPart，而 `execution.result.content` 才是结果正文。发送给模型的是结果消息，不是直接把 ToolExecution 当成消息发送。
+因此 `execution.result` 是一个 ToolMessage，而 `execution.result.content` 才是结果正文。发送给模型的是结果消息，不是直接把 ToolExecution 当成消息发送。
 
 ## 12. Runtime 的方法：循环固定，每个位置做什么
 
@@ -875,11 +468,11 @@ Day 1 的两个字段内容相同，但 raw 使用深复制，保留独立对象
 | --- | --- | --- |
 | `start(prompt)` | 检查输入，创建用户消息 | history 增加用户输入，started=True |
 | `begin_turn()` | 暂无额外动作 | 默认不改变历史 |
-| `prepare()` | deepcopy 当前 history | 返回本轮可读取的历史副本 |
-| `on_response(response)` | 保存完整模型响应 | history 增加 ModelResponse |
+| `prepare()` | 在 history 副本前添加固定 SystemMessage | 返回本轮输入视图 |
+| `on_response(response)` | 保存完整模型响应 | history 增加 AIMessage |
 | `execute(call)` | 调用基础 execute_tool | 返回 ToolExecution |
 | `on_result(execution)` | 保存执行记录 | executions 增加一项 |
-| `after_turn(results)` | 有结果时统一包装为请求消息 | history 增加带 ToolReturnPart 的 ModelRequest |
+| `after_turn(results)` | 有结果时 history.extend(results) | history 按顺序增加独立 ToolMessage |
 | `retry(error)` | 返回 False | Day 1 默认不重试 |
 | `finish(status, reason)` | 暂无持久化或监听器动作 | Day 1 不会因此自动保存数据库 |
 
@@ -899,11 +492,11 @@ Day 1 的两个字段内容相同，但 raw 使用深复制，保留独立对象
 response = await runtime.io.request(model, messages, max_tokens=2048)
 ```
 
-意思是：执行请求并等待完成，完成后把 ModelResponse 保存为 response。等待网络期间，事件循环可以安排其他可运行的异步任务。
+意思是：执行请求并等待完成，完成后把 AIMessage 保存为 response。等待网络期间，事件循环可以安排其他可运行的异步任务。
 
 **await 不会自动创建多个 Agent，也不会让一个 for 循环自动并行。** Day 1 仍然按代码顺序等待请求、执行工具、收集结果。
 
-普通 `read_file` 是同步函数。基础 Runtime 在异步方法中直接调用它，不会因此自动变成后台线程；这是小文件只读起点的实现边界。
+普通 `read_file` 是同步函数。基础 Runtime 用 await asyncio.to_thread(execute_tool, call, workspace) 接入，事件循环等待线程结果。取消 await 不会强制终止已经运行的文件读取线程。
 
 ### 13.2 asyncio.run 是入口桥梁
 
@@ -919,7 +512,7 @@ asyncio.run(run_agent(prompt, Path.cwd()))
 
 普通 `with` 常用于文件打开与关闭。`async with` 则让资源进入和退出过程可以异步等待。
 
-`async with runtime.io.factory() as model`：先由 factory 创建模型适配对象，再进入其异步资源上下文，使用期间命名为 model，退出时按适配器约定管理客户端资源。
+`async with runtime.io.factory() as model`：先由 factory 创建我们提供的异步上下文管理器，进入后创建并得到模型客户端，使用期间命名为 model，退出时按适配器约定管理客户端资源。
 
 `async with asyncio.timeout(runtime.options.timeout)`：为里面的运行步骤设置时间范围。超时时，取消在异步可响应位置发生，退出这个 timeout 上下文时通常表现为 TimeoutError。
 
@@ -927,156 +520,75 @@ asyncio.run(run_agent(prompt, Path.cwd()))
 
 ## 14. 逐行读 response_calls：从一份响应提取工具调用
 
-这个函数来自 Zeta，职责是：检查响应是否适合消费，返回其中的工具调用列表。它不执行工具，不发模型请求。
+职责保持原样：检查响应是否适合消费，返回工具调用列表；不执行工具、不发请求。
 
-### 14.1 先排除不完整或异常结束的响应
+### 14.1 先排除片段与非法参数
 
-```text
-if response.state != "complete" or response.finish_reason not in ("stop", "tool_call"):
-    raise UnexpectedModelBehavior("incomplete model response")
-```
+检查 isinstance(response, AIMessageChunk) 和 response.invalid_tool_calls。任何一项成立都抛 ModelResponseError。随后要求 content 是字符串，这是本课的非思考文字模式边界。
 
-`or` 表示只要任意一项不满足，就拒绝。这是当前练习的保守策略，并不是对所有模型、所有应用的唯一通用策略。
-
-`UnexpectedModelBehavior` 是 PydanticAI 提供的异常类。这里由我们的校验主动抛出，表示结果不满足当前循环预期。
-
-### 14.2 从混合片段中筛出 ToolCallPart
+### 14.2 直接取出 LangChain 已解析的调用
 
 ```text
-calls = [part for part in response.parts if isinstance(part, ToolCallPart)]
+calls = list(response.tool_calls)
 ```
 
-这是列表推导式，按下面顺序理解：
-
-1. `for part in response.parts`：依次拿到每个片段。
-2. `if isinstance(...)`：只保留工具调用类型。
-3. 最前面的 `part`：把原来的那个对象放进新列表。
-
-它与下面的展开写法表达同样的筛选逻辑：
-
-```text
-calls = []
-for part in response.parts:
-    if isinstance(part, ToolCallPart):
-        calls.append(part)
-```
-
-结果是 `list[ToolCallPart]`。如果只有文字，得到 `[]`；如果文字加两个工具调用，得到只含那两个工具调用的列表。这里没有深复制工具对象。
+不再从混合 parts 里按 ToolCall 类型筛选。列表中的元素仍是原调用字典；只有文字时得到空列表。
 
 ### 14.3 取出编号，检查空白和重复
 
 ```text
-ids = [call.tool_call_id for call in calls]
-```
-
-对两个调用，结果可能是 `['call_001', 'call_002']`。
-
-```text
-any(not value.strip() for value in ids)
-```
-
-对每个编号去掉两端空白，再看是否为空。`""` 和 `"   "` 都不合格。检查不会自动把合法 ID 改写为 strip 后的版本。
-
-```text
+ids = [call["id"] for call in calls]
+any(not value or not value.strip() for value in ids)
 len(ids) != len(set(ids))
 ```
 
-例如 `['call_001', 'call_001']` 原长 2，去重后长 1，说明同批有重复编号。
+第一项排除 None、空字符串和全空格，第二项排除同批重复。检查不会把合法 ID 改写成 strip 后的字符串。
 
-### 14.4 没有工具调用时，必须有可用最终文字
+### 14.4 结束原因必须与内容一致
 
 ```text
-if not calls and (
-    response.finish_reason != "stop" or not (response.text or "").strip()
-):
-    raise UnexpectedModelBehavior("missing final text")
+expected_reason = "tool_calls" if calls else "stop"
+response.response_metadata.get("finish_reason") != expected_reason
 ```
 
-只有 `calls` 为空才进入这项最终回答检查。`response.text or ""` 把 None 统一为可 `.strip()` 的字符串；去掉空白后仍为空，就没有可用文字。
-
-最后 `return calls`：有调用返回调用列表；正常最终回答返回空列表。这个设计让 run_loop 用同一返回值决定“执行工具继续”还是“返回最终回答”。
+不匹配就拒绝。没有工具调用时，还要求 response.text.strip() 非空。最后 return calls，有调用返回列表，正常最终回答返回 []。
 
 ## 15. 逐行读 validate_history：pending 是“还欠着哪些结果”
 
-工具调用与结果是关联记录。发起下一次模型请求之前，不能把缺一半的历史发过去。
-
 ### 15.1 pending 字典长什么样
 
-```text
-pending: dict[str, str] = {}
-```
+pending: dict[str, str] 的键是调用 ID，值是工具名。例如 {"call_001": "read", "call_002": "read"} 表示尚欠两条结果，不表示工具正在后台运行。
 
-键是工具调用编号，值是工具名称。两个调用进入后：
+### 15.2 看见 AIMessage 时登记调用
 
-```text
-{
-    "call_001": "read",
-    "call_002": "read"
-}
-```
+先要求上一批 pending 为空，再用 response_calls 复用响应检查，把 call["id"] 和 call["name"] 登记进去。无调用的最终响应不增加 pending。
 
-它只记录“哪个调用还没看到结果”，不记录文件正文，也不代表工具正在后台运行。
-
-### 15.2 看见模型响应时，把调用登记进去
+### 15.3 看见 ToolMessage 时核销结果
 
 ```text
-if isinstance(message, ModelResponse):
-    if pending:
-        raise ValueError("assistant response before complete tool results")
-    for call in response_calls(message):
-        pending[call.tool_call_id] = call.tool_name
+elif isinstance(message, ToolMessage):
+    if pending.get(message.tool_call_id) != message.name:
+        raise ValueError("unmatched tool result")
+    del pending[message.tool_call_id]
 ```
 
-如果上一批 pending 还没清空，就先出现下一条模型响应，说明中间缺结果，所以拒绝。
+ToolMessage 本身就是结果消息，所以这一层直接检查 message，不遍历 message.parts。没有编号、重复结果或工具名称不一致都会拒绝。
 
-然后调用已经写好的 `response_calls`，不用再复制一遍响应校验。每个工具调用登记为“欠一条结果”。文字最终响应返回空列表，自然不会登记任何调用。
+遇到 HumanMessage / SystemMessage 时，如果 pending 还非空，也拒绝在工具批次中插入普通消息。其他消息类型不在本课协议范围内。
 
-### 15.3 看见请求消息时，逐个核销结果
+### 15.4 手动跟踪 pending
 
-Day 1 参考答案的另一个分支是：
-
-```text
-else:
-    for part in message.parts:
-        if isinstance(part, ToolReturnPart):
-            if pending.get(part.tool_call_id) != part.tool_name:
-                raise ValueError("unmatched tool result")
-            del pending[part.tool_call_id]
-        elif pending:
-            raise ValueError("message inserted inside a tool batch")
-```
-
-逐步理解：
-
-- 此处 `else` 对应外层 `if isinstance(message, ModelResponse)`。在合法 ModelMessage 范围内，它处理的是 **ModelRequest**。
-- 遇到工具结果，按它的编号在 pending 查名称。
-- 找不到编号时 get 返回 None，与工具名称不相等，拒绝。
-- 编号找到了但工具名称不匹配，也拒绝。
-- 编号和名称对应，删除 pending 中这一项，表示已经收到结果。
-- 若还欠工具结果，却插入其他普通片段，就拒绝破坏这个批次。
-
-**缩进决定这段代码在处理谁。** 不能把遍历 ToolReturnPart 的循环缩进到 ModelResponse 分支里；本地 read 的 ToolReturnPart 在 ModelRequest 中，否则你检查不到真正的工具结果。
-
-### 15.4 用完整历史手动跟踪字典
-
-| 正在读到的内容 | pending 处理前 | 做什么 | pending 处理后 |
-| --- | --- | --- | --- |
-| 用户输入 UserPromptPart | `{}` | 没有欠结果，允许 | `{}` |
-| 模型调用 call_001/read | `{}` | 登记 | `{'call_001': 'read'}` |
-| 工具返回 call_001/read | `{'call_001': 'read'}` | 配对并删除 | `{}` |
-| 模型最终 TextPart | `{}` | 没有调用，不登记 | `{}` |
-
-末尾 `if pending: raise ...` 表示：所有历史都读完了仍欠结果，不能发送。
-
-以下情况也会被拒绝：只有结果没有调用；相同结果重复出现；结果名称错误；只补齐两个调用中的一个。
-
-这个函数成功时返回 None，因为它的工作是“允许继续或抛错”，不用产出新的历史。
+| 读到的消息 | pending |
+| --- | --- |
+| HumanMessage(问题) | {} |
+| AIMessage(read call_001、read call_002) | 两个编号 |
+| ToolMessage(call_001) | 只剩 call_002 |
+| ToolMessage(call_002) | {} |
+| AIMessage(最终文字) | {} |
 
 ### 15.5 为什么在这个位置校验
 
-工具调用响应刚加入 history、工具还没执行完的短暂阶段，history 有 pending 是正常的。Day 1 在下一次模型请求前校验，要求那时必须完整。
-
-一旦预算耗尽或工具失败，运行可以带着未完成批次停止，但不能把它当成可直接续发的完整历史。之后 Session 的恢复单元才处理这种状态；校验函数不会自动替你重放工具。
+发送下一次请求之前，必须已有完整调用与结果组。保存过程中允许出现暂时 pending，恢复与下一次请求却不能把缺结果的历史直接发给模型。Session 的这个原则仍沿用原版。
 
 ## 16. 逐段读 run_loop：它只是反复推动同一条消息链
 
@@ -1097,13 +609,13 @@ else:
 3. `validate_history(messages)`：确保调用和结果完整。
 4. `runtime.requests += 1`：在尝试请求前计数，请求失败也消耗一次尝试额度。
 
-`while runtime.requests < runtime.options.max_requests` 控制最多尝试几次请求。这里的次数不是 message 条数，也不是 parts 数量。
+`while runtime.requests < runtime.options.max_requests` 控制最多尝试几次请求。这里的次数不是 message 条数，也不是工具调用数量。
 
 ### 16.3 发请求并处理允许的重试
 
-`response = await runtime.io.request(...)` 返回一份 ModelResponse。
+`response = await runtime.io.request(...)` 返回一份 AIMessage。
 
-`except ModelHTTPError as error` 捕获模型服务 HTTP 错误。只有还有请求额度且 `runtime.retry(error)` 返回 True，才执行 continue 重新进入循环。Day 1 默认 retry=False，所以不是“任何错误自动重试”。Day 7 才加入特定上下文超长的压缩重试策略。
+`except APIStatusError as error` 捕获模型服务 HTTP 错误。只有还有请求额度且 `runtime.retry(error)` 返回 True，才执行 continue 重新进入循环。Day 1 默认 retry=False，所以不是“任何错误自动重试”。Day 7 才加入特定上下文超长的压缩重试策略。
 
 ### 16.4 校验、保存响应、整批检查预算
 
@@ -1126,7 +638,7 @@ tool_calls + len(calls) > max_tool_calls
 ### 16.5 执行和汇总工具结果
 
 ```text
-results: list[ToolReturnPart] = []
+results: list[ToolMessage] = []
 for call in calls:
     execution = await runtime.execute(call)
     await runtime.on_result(execution)
@@ -1146,12 +658,12 @@ await runtime.after_turn(results)
 
 | 名字 | 例子 | 回答什么问题 |
 | --- | --- | --- |
-| `response.state` | `"complete"` | 这份模型响应是否完整？ |
-| `response.finish_reason` | `"stop"` | 这一轮生成为什么结束？ |
+| 消息类型与 invalid_tool_calls | 完整 AIMessage、无非法调用 | 这份模型响应是否可消费？ |
+| `response.response_metadata["finish_reason"]` | `"stop"` | 这一轮生成为什么结束？ |
 | `status: RunStatus` | `"completed"` | 整次 Zeta 运行最后怎样结束？ |
-| `ToolReturnPart.outcome` | `"success"` | 这一次工具执行怎样结束？ |
+| `ToolMessage.status` | `"success"` | 这一次工具执行怎样结束？ |
 
-注意 `complete` 与 `completed` 不是随意混用的两个拼法，它们属于不同字段的不同约定。
+LangChain 这里没有旧版的 complete 状态字段；completed 仍是 Zeta 整次运行的终态值。
 
 ## 17. 异常、取消、finally 和日志
 
@@ -1162,8 +674,8 @@ await runtime.after_turn(results)
 | 异常 | 来源 | 在 Day 1 中的用途 |
 | --- | --- | --- |
 | `ValueError` | Python | 参数、历史配对等不符合约定 |
-| `UnexpectedModelBehavior` | PydanticAI | 响应内容不符合循环预期 |
-| `ModelHTTPError` | PydanticAI | 模型服务 HTTP 错误，可读取 status_code 等信息 |
+| `ModelResponseError` | Zeta | 响应内容不符合循环预期 |
+| `APIStatusError` | 底层 OpenAI SDK | 模型服务 HTTP 错误，可读取 status_code 等信息 |
 | `RunLimitError` | Zeta | 请求或工具额度耗尽 |
 | `RunStopped` | Zeta，继承 RunLimitError | 后续 Hook 主动要求停止 |
 | `ToolError` | Zeta | read 参数或文件读取等预期失败 |
@@ -1200,11 +712,11 @@ await runtime.after_turn(results)
 | `cli.py: main` | 用户输入从哪里来，怎样进入异步函数，异常怎样显示？ |
 | `app.py: run_agent` | 选择哪个 Runtime，怎样调用固定循环？ |
 | `loop.py: run_loop` | 一轮请求结束后，为什么继续或停止？ |
-| `loop_common.py: response_calls` | 响应内哪些片段是调用，响应是否可消费？ |
+| `loop_common.py: response_calls` | 响应的 tool_calls 中有哪些调用，响应是否可消费？ |
 | `loop_common.py: validate_history` | 已有调用是否都有对应结果？ |
 | `runtime_base.py: Runtime` | 历史、计数器放在哪，各步骤如何改变它们？ |
 | `model_io.py: request_once` | 用什么工具定义和设置发送一次请求？ |
-| `tools.py: execute_tool` | 怎样从 ToolCallPart 选工具并校验参数？ |
+| `tools.py: execute_tool` | 怎样从 ToolCall 选工具并校验参数？ |
 | `tools.py: read_file` | 哪一行真正读取了本机文件？ |
 
 这些位置描述的是 Day 1 和 support.md 组合后的目标代码。有些文件可能尚未由你在 src 中准备完成；文档有完整代码不代表当前 CLI 已经跑通。
@@ -1219,10 +731,10 @@ support.md 还提供了 SQLite 存储和摘要函数。它们主要在后续单�
 
 以 `results.append(execution.result)` 为例：
 
-1. 左边 results 是什么类型？——本轮 ToolReturnPart 列表。
+1. 左边 results 是什么类型？——本轮 ToolMessage 列表。
 2. append 是属性还是方法？——带括号，是列表的方法。
 3. 括号里的 execution 是什么？——ToolExecution 对象。
-4. execution.result 又是什么？——最终采用的 ToolReturnPart。
+4. execution.result 又是什么？——最终采用的 ToolMessage。
 5. 整句有什么效果？——把一个结果对象放入列表，尚未发送给模型。
 
 常用名字速查：
@@ -1231,15 +743,15 @@ support.md 还提供了 SQLite 存储和摘要函数。它们主要在后续单�
 | --- | --- |
 | `message` | 历史中的一条消息，可能是请求或响应 |
 | `messages` / `history` | 多条消息组成的序列，前者常是当前视图，后者常是保存的历史 |
-| `response` | 一次模型返回的 ModelResponse 对象 |
-| `parts` | 某个对象的组成部分；消息 parts 和路径 parts 不能混用 |
-| `part` | 正在遍历的一段内容，要先看具体类型 |
-| `calls` | 从本轮响应筛出的 ToolCallPart 列表 |
+| `response` | 一次模型返回的 AIMessage 对象 |
+| `Path.parts` | 文件路径组件；LangChain 消息不使用旧版 response.parts |
+| `tool_calls` | AIMessage 上的调用字典列表 |
+| `calls` | 从本轮响应筛出的 ToolCall 列表 |
 | `call` | 某一次具体工具调用的数据 |
-| `tool_name` | 调用哪个工具 |
+| `call["name"]` / `ToolMessage.name` | 调用与结果对应的工具名 |
 | `tool_call_id` | 这次调用的编号，结果原样带回 |
-| `args` | 调用输入参数，可为 JSON 文本或 Python 字典等 |
-| `content` | 内容；具体是问题、文字还是工具正文，要看所属 Part 类型 |
+| `call["args"]` | LangChain 已解析的参数字典 |
+| `content` | 内容；具体是问题、文字还是工具正文，要看所属消息类型 |
 | `result` | 这里通常指一个工具结果对象，注意具体函数的类型注解 |
 | `results` | 本轮工具结果列表 |
 | `execution` | Zeta 保存的原始/最终工具结果组合 |
@@ -1247,24 +759,19 @@ support.md 还提供了 SQLite 存储和摘要函数。它们主要在后续单�
 | `runtime` | 保存运行状态并提供各步骤方法的对象 |
 | `options` | 本次运行的额度和时限配置 |
 | `io` | 保存模型创建/请求函数的配置对象 |
-| `state` | 模型响应的完整状态 |
+| `invalid_tool_calls` | LangChain 未能解析的调用，非空时拒绝响应 |
 | `finish_reason` | 模型这一轮结束生成的原因 |
-| `status` | Zeta 整次运行的终态 |
-| `outcome` | 某次工具的处理结果 |
+| `status` | 看所属对象：运行终态，或 ToolMessage 的 success/error |
+| `artifact` | 本地工具元数据；本课用它保留 denied/failed 区别 |
 
 这些小写变量名多数是程序作者起的，不能只靠名字猜类型。优先看它在哪里赋值、函数签名怎么写、类里声明了什么字段。
 
 读回 Day 1 时，只要能顺着说出下面这段话，就有了开始写代码的基础：
 
-> 我先把用户输入包装成 ModelRequest。一次模型请求返回 ModelResponse，它的 parts 可能有文字和工具调用。我筛出 ToolCallPart，验证它的名称、参数和编号，由本地代码执行工具。执行结果包装成同编号的 ToolReturnPart，放入新的 ModelRequest。把完整历史再发给模型，直到获得没有工具调用的有效最终文字，或者触发明确的停止条件。
+> 我先把用户输入包装成 HumanMessage。一次模型请求返回 AIMessage，我从 tool_calls 取出调用，检查名称、参数和编号，再由本地代码执行工具。执行结果包装成同编号的 ToolMessage，直接追加到历史。把完整历史再发给模型，直到得到没有工具调用的有效最终文字，或者触发明确的停止条件。
 
 ## 20. 资料依据与后续查阅
 
-本篇字段和值已对照本地安装源码：
+课程结构来自 [GitHub 9359d5f](https://github.com/juemimgcd/Zeta/tree/9359d5fadadaf82ef42ae600be22d565cf72a984/days)。当前接口依据 [LangChain OpenAI 兼容接口 接入](https://docs.langchain.com/oss/python/integrations/chat/openai)、[消息说明](https://docs.langchain.com/oss/python/langchain/messages) 和 [消息序列化 API](https://reference.langchain.com/python/langchain-core/messages)。
 
-- [PydanticAI 消息定义源码](../.venv/lib/python3.14/site-packages/pydantic_ai/messages.py)：ModelRequest、ModelResponse、各 Part、state 和 finish_reason、text 属性。
-- [PydanticAI direct 源码](../.venv/lib/python3.14/site-packages/pydantic_ai/direct.py)：单次 model_request 的入口。
-- [项目现有工具实现](../src/zeta/tools.py)：ReadArgs、工具定义、参数校验和 read_file。
-- [Day 1 参考代码](day1.md) 与 [固定基础代码](support.md)：Zeta 自己的 Loop、Runtime、配置和异常约定。
-
-线上官方资料用于交叉核对消息分类和单次请求入口，可能比本项目安装版新；尤其不要直接把新版工具返回字段搬进 2.37.0：[消息 API](https://pydantic.dev/docs/ai/api/pydantic-ai/messages/)、[direct API](https://pydantic.dev/docs/ai/api/pydantic-ai/direct/)。本篇详细字段解释以本地源码为依据。
+完整可复制代码以 support.md 和各日参考答案为准。异步入口、Runtime、SQLite 与后续并发 Worker 保留原版职责；这篇前置阅读不增加实现任务，也不说明现有 src 已完成迁移。

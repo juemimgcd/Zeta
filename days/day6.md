@@ -19,6 +19,19 @@
 - summarize_once 是 support.md 已提供的无工具单次模型请求；摘要不能执行行动工具。
 - 摘要失败或源文本过大时明确停止；本版没有分块摘要引擎。Day 7 重建 Context 验收候选后才提交，原摘要与原历史保留。
 
+## 先认识本日的类型与函数
+
+本日没有新增类，复用 [Day 5](day5.md#先认识本日的类与函数) 的 Summary（摘要及覆盖范围）、Budget（输入预算），以及 [Day 3](day3.md#先认识本日的类与函数) 的 Entry（原始记录）。`DEFAULT_BUDGET` 是 Budget 实例。
+
+`Summarizer = Callable[[str], Awaitable[str]]` 是函数类型别名：接收提示词字符串，调用后得到可等待对象，await 后得到摘要字符串。`text = await summarize_once(prompt)` 中的 summarize_once 就是调用方传入的函数。
+
+| 函数 | 输入、功能和返回值 |
+| --- | --- |
+| `choose_compaction_range(entries, keep_recent=1)` | 接收未被摘要覆盖的记录及至少保留的近期任务数；按任务分组，保留近期完整任务及进行中的任务，返回可压缩旧记录列表，无可选范围时返回空列表 |
+| `compact(entries, previous_summary, summarize_once, budget=..., memory_ids=...)` | 选择新覆盖范围，把旧摘要和新记录交给摘要回调，检查非空且缩短；返回合并 covered_ids/memory_ids、递增版本的新 Summary；不删除原历史，不自动保存候选摘要 |
+
+`remaining` 是未被旧摘要覆盖的记录，`covered` 是本次新增覆盖记录，`previous` 是旧摘要正文，`text` 是回调返回的新正文，都是局部变量。Day 7 验证候选能改善上下文后才保存。
+
 ## 完整练习骨架
 
 导包、异常类、字段、初始化和辅助实现已给出，只填 TODO 函数体。NotImplementedError 是未完成提示；移除它并填写真实逻辑后再验收。骨架暂时关闭未使用导入提示，其他类型检查保持开启。
@@ -33,7 +46,7 @@
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
-from pydantic_ai.messages import ModelResponse
+from langchain_core.messages import AIMessage
 
 from zeta.context import (
     Budget,
@@ -91,7 +104,7 @@ async def compact(
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
-from pydantic_ai.messages import ModelResponse
+from langchain_core.messages import AIMessage
 
 from zeta.context import (
     Budget,
@@ -116,7 +129,7 @@ def choose_compaction_range(
     if not turns:
         return []
     last = decode(turns[-1][-1])
-    active = not isinstance(last, ModelResponse) or bool(response_calls(last))
+    active = not isinstance(last, AIMessage) or bool(response_calls(last))
     reserve = keep_recent + int(active)
     return [entry for turn in turns[: max(0, len(turns) - reserve)] for entry in turn]
 
