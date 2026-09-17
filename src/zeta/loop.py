@@ -29,6 +29,7 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                 while runtime.requests < runtime.options.max_requests:
                     await runtime.begin_turn()
                     messages = await runtime.prepare()
+                    # Validate once, after all context preparation and hooks.
                     validate_history(messages)
                     runtime.requests += 1
                     try:
@@ -46,6 +47,7 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                             continue
                         raise
 
+                    # Validate the new response before saving or executing it.
                     calls = response_calls(response)
                     await runtime.on_response(response)
                     results: list[ToolMessage] = []

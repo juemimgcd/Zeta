@@ -23,8 +23,8 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
         async with asyncio.timeout(runtime.options.timeout):
             await runtime.start(prompt)
             async with runtime.io.factory() as model:
+                await runtime.begin_turn()
                 while runtime.requests < runtime.options.max_requests:
-                    await runtime.begin_turn()
                     messages = await runtime.prepare()
                     validate_history(messages)
                     try:
@@ -36,55 +36,46 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                     except ModelHTTPError as e:
                         if (
                             runtime.requests < runtime.options.max_requests
-                            and await runtime.retry(e)
+                            or await runtime.retry(e)
                         ):
                             continue
-                        raise
                     calls = response_calls(response)
                     await runtime.on_response(response)
-                    result:list[ToolMessage] = []
+                    results:list[ToolMessage] = []
                     if calls:
                         if (
-                            runtime.tool_calls + len(calls) > runtime.options.max_tool_calls
-                            or runtime.requests >= runtime.options.max_requests
+                            runtime.requests >= runtime.options.max_requests
+                            or runtime.tool_calls + len(calls) >= runtime.options.max_tool_calls
                         ):
-                            raise RuntimeError()
-
-                        runtime.tool_calls + len(calls)
+                            raise RunLimitError("")
+                        runtime.tool_calls += len(calls)
                         for call in calls:
                             execution = await runtime.execute(call)
                             await runtime.on_result(execution)
-                            result.append(execution.result)
-                    await runtime.after_turn(result)
+                            results.append(execution.result)
                     if not calls:
                         status = "completed"
                         return response.text or ""
 
 
-
-                raise RunLimitError("ppppp")
-
-
-
+                raise RunLimitError("")
 
     except BaseException as e:
         primary = e
         status = (
-            "cancelled"
+            "stopped"
             if isinstance(e,asyncio.CancelledError)
-            else ("stopped" if isinstance(e,RuntimeError) else "failed")
+            else ("canceled" if isinstance(e,RuntimeError) else "failed")
         )
-        reason = (
-            str(e) if isinstance(e,RuntimeError) else type(e).__name__
-        )
+        reason = str(e) if isinstance(e,RuntimeError) else type(e).__name__
         raise
-
     finally:
         try:
             await runtime.finish(status,reason)
-        except RunLimitError as e:
-            logger.error(e)
-
+        except BaseException as e:
+            if primary is None:
+                raise
+            logger.error("")
 
 
 

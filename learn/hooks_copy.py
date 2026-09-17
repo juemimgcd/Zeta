@@ -1,9 +1,10 @@
 # ruff: noqa: F401  # Prepared imports for exercise bodies.
 # pyright: reportUnusedImport=false
+import inspect
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -11,6 +12,8 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
+
+from zeta.loop_common import validate_history
 
 type HookName = Literal[
     "before_model", "after_model", "before_tool", "after_tool", "after_turn"
@@ -27,7 +30,7 @@ class Decision:
 class ToolContext:
     name: str
     call_id: str
-    args: dict[str, Any]
+    path: str
 
 
 type HookContext = list[BaseMessage] | AIMessage | ToolContext | ToolMessage
@@ -62,53 +65,59 @@ class Hooks:
             if result is None:
                 continue
             if name == "before_model":
-                if not isinstance(current, list) or not isinstance(result, list):
-                    raise TypeError("before_model must return a message list")
-                if not current or len(result) < len(current):
-                    raise ValueError("hook cannot remove the prepared context")
-                if result[-len(current):] != current:
-                    raise ValueError("hook cannot rewrite prepared messages")
-                for message in result[: -len(current)]:
+                if not isinstance(current,list) or not isinstance(result,list):
+                    raise TypeError("before_model must return a list")
+                if not current or len(current) > len(result):
+                    raise TypeError("before_model must return a list")
+                if result[:-len(current)] != current:
+                    raise TypeError("before_model must return a list")
+                for message in result[:-len(current)]:
                     if (
-                            not isinstance(message, HumanMessage)
-                            or not isinstance(message.content, str)
-                            or not message.content.strip()
+                        not isinstance(message,HumanMessage)
+                        or not isinstance(message.content,str)
+                        or not message.content.strip()
                     ):
-                        raise ValueError(
-                            "hook may only prepend user-level context data"
-                        )
+                        raise TypeError("before_model must return a human message")
                 current = deepcopy(result)
+                validate_history(result)
             elif name == "after_tool":
-                if not isinstance(current, ToolMessage) or not isinstance(
-                        result, ToolMessage
-                ):
-                    raise TypeError("after_tool must return a tool result")
+                if not isinstance(current,ToolMessage) or not isinstance(result,ToolMessage):
+                    raise TypeError("after_tool must return a ToolMessage")
                 if (
-                        result.name,
-                        result.tool_call_id,
-                        result.status,
-                        result.artifact,
+                    result.name,
+                    result.tool_call_id,
+                    result.status,
+                    result.artifact
                 ) != (
-                        current.name,
-                        current.tool_call_id,
-                        current.status,
-                        current.artifact,
+                    current.name,
+                    current.tool_call_id,
+                    current.status,
+                    current.artifact
                 ):
-                    raise ValueError("hook changed tool result identity or outcome")
+                    raise TypeError("after_tool must return a ToolMessage")
                 current = deepcopy(result)
-            elif name in ("before_tool", "after_turn"):
-                if not isinstance(result, Decision):
-                    raise TypeError("decision hook must return Decision")
+            elif name in ("before_mode","after_turn"):
+                if not isinstance(result,Decision):
+                    raise TypeError("after_mode must return a Decision")
                 if result.stop:
                     if not result.reason.strip():
-                        raise ValueError("a stop/deny decision needs a reason")
+                        raise TypeError("after_mode must return a Decision")
                     return result
             else:
-                raise TypeError("after_model is read-only and must return None")
-        if name in ("before_tool", "after_turn"):
+                raise TypeError("after_mode must return a Decision")
+
+        if name in ("after_turn","before_tool"):
             return Decision()
         if name == "after_model":
             return None
-        if isinstance(current,(list,ToolMessage)):
+        if isinstance(current,(ToolMessage,list)):
             return current
-        raise TypeError("invalid hook context")
+        raise TypeError("after_model must return a ToolMessage")
+
+
+
+
+
+
+
+

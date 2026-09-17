@@ -14,7 +14,7 @@
 | `response.parts` 中的工具片段 | `response.tool_calls`，其中每个 `ToolCall` 是字典 |
 | `call.tool_name` / `call.args` / `call.tool_call_id` | `call["name"]` / `call["args"]` / `call["id"]` |
 | `ToolReturnPart` | 独立的 `ToolMessage`，保留 tool_call_id 与 name |
-| `response.state` / `response.finish_reason` | 排除 `AIMessageChunk` 与 `invalid_tool_calls`，检查 `response_metadata["finish_reason"]` |
+| `response.state` / `response.finish_reason` | 排除 `AIMessageChunk` 与 `invalid_tool_calls`；不强制匹配 `finish_reason` |
 | `model_request(...)` | 接入层 `await requester.ainvoke(...)` |
 
 `response_calls` 校验后的调用 ID 都是非空字符串；下游代码中的 `call["id"] or ""` 只是收窄 LangChain 的 `str | None` 类型，不能拿它代替校验或生成新编号。
@@ -49,7 +49,7 @@
 
 | 函数 | 输入、功能和返回值 |
 | --- | --- |
-| `response_calls(response)` | 接收完整 AIMessage，检查类型、正文、调用 ID 和结束原因；返回 ToolCall 字典列表，无工具时为空列表，非法则抛异常 |
+| `response_calls(response)` | 接收完整 AIMessage，拒绝流式片段、未解析调用和空白或重复的调用 ID；返回 ToolCall 字典列表，无工具时为空列表，非法则抛异常 |
 | `validate_history(messages)` | 接收有序消息序列，检查工具调用与结果完整配对；正常返回 None，非法则抛异常 |
 | `run_loop(prompt, runtime)` | 接收问题字符串或恢复标记 None，以及 Runtime；驱动准备消息、请求、执行工具和写回结果，返回最终回答字符串；结束时调用 finish，错误和取消向外传播 |
 
@@ -96,9 +96,9 @@ class RunStopped(RunLimitError):
 def response_calls(response: AIMessage) -> list[ToolCall]:
     # ainvoke returns a full message; a stream chunk must never execute tools.
     """TODO：
-    1. 检查完整消息类型、invalid_tool_calls 和结束原因。
+    1. 拒绝 AIMessageChunk 和非空 invalid_tool_calls。
     2. 提取调用并检查 ID 非空、同批唯一。
-    3. 无调用时要求正常结束且文本非空。"""
+    3. 返回 response.tool_calls；无调用时返回空列表。"""
     raise NotImplementedError("请完成 response_calls")
 
 
@@ -158,8 +158,6 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
-    HumanMessage,
-    SystemMessage,
     ToolCall,
     ToolMessage,
 )
@@ -180,45 +178,35 @@ class RunStopped(RunLimitError):
 
 
 def response_calls(response: AIMessage) -> list[ToolCall]:
-    # ainvoke returns a full message; a stream chunk must never execute tools.
+    """Reject unparsed calls or ambiguous IDs before executing tools."""
     if isinstance(response, AIMessageChunk) or response.invalid_tool_calls:
         raise ModelResponseError("incomplete response or invalid tool arguments")
-    if not isinstance(response.content, str):
-        raise ModelResponseError("this lesson expects a text-only response")
-    calls = list(response.tool_calls)
+    calls = response.tool_calls
     ids = [call["id"] for call in calls]
     if any(not value or not value.strip() for value in ids) or len(ids) != len(
         set(ids)
     ):
         raise ModelResponseError("ambiguous tool call IDs")
-    if any(not call["name"].strip() for call in calls):
-        raise ModelResponseError("missing tool name")
-    expected_reason = "tool_calls" if calls else "stop"
-    if response.response_metadata.get("finish_reason") != expected_reason:
-        raise ModelResponseError("incomplete model response")
-    if not calls and not response.text.strip():
-        raise ModelResponseError("missing final text")
     return calls
 
 
 def validate_history(messages: Sequence[BaseMessage]) -> None:
-    """Check complete AIMessage/ToolMessage call-result groups."""
+    """Check only tool-result pairing and batch order."""
     pending: dict[str, str] = {}
     for message in messages:
-        if isinstance(message, AIMessage):
-            if pending:
-                raise ValueError("assistant response before complete tool results")
-            for call in response_calls(message):
-                pending[call["id"] or ""] = call["name"]
-        elif isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage):
             if pending.get(message.tool_call_id) != message.name:
                 raise ValueError("unmatched tool result")
             del pending[message.tool_call_id]
-        elif isinstance(message, (HumanMessage, SystemMessage)):
-            if pending:
-                raise ValueError("message inserted inside a tool batch")
-        else:
-            raise TypeError("unsupported message type")
+            continue
+        if pending:
+            raise ValueError("message inserted before complete tool results")
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                call_id = call["id"]
+                if not call_id or not call_id.strip() or call_id in pending:
+                    raise ValueError("ambiguous tool call IDs in history")
+                pending[call_id] = call["name"]
     if pending:
         raise ValueError("incomplete tool batch")
 ```
@@ -394,12 +382,11 @@ messages = [
 run_loop
   └─ await runtime.io.request(model, messages, max_tokens=...)
        └─ await request_once(model, messages, max_tokens=...)
-            └─ await request_with_tools(model, messages, tools=read 的定义, ...)
-                 ├─ requester = model.bind_tools(...)
-                 └─ response = await requester.ainvoke(messages, ...)
+            ├─ requester = model.bind_tools(...)
+            └─ return await requester.ainvoke(messages, ...)
 ```
 
-`ModelIO.request` 保存的默认函数就是 `request_once`。`request_once` 带上工具说明，交给 `request_with_tools`；`bind_tools` 把工具名、用途和参数格式提供给模型；到 **`ainvoke`** 才发出本次请求。
+`ModelIO.request` 保存的默认函数就是 `request_once`。`request_once` 默认取出已注册的工具说明并直接发起请求；`bind_tools` 把工具名、用途和参数格式提供给模型；到 **`ainvoke`** 才发出本次请求。
 
 模型返回的 `AIMessage` 沿着调用链返回，最终赋给 `run_loop` 中的 `response`。外面虽然套了几个函数，本轮只有一次模型请求。
 
@@ -417,7 +404,7 @@ response = AIMessage(
 
 此时 `read_file` 还没运行。模型给出的是“请执行这个工具”的结构化请求。
 
-`run_loop` 接着执行 `calls = response_calls(response)`。这个函数检查响应不是流式片段、没有无效工具参数、正文类型符合要求、调用 ID 非空且同批唯一、工具名非空、结束原因与调用情况一致；无工具时还要求最终文本非空。合法就返回调用列表，非法就抛 `ModelResponseError`。
+`run_loop` 接着执行 `calls = response_calls(response)`。这个函数只检查响应不是流式片段、没有未解析的工具调用、调用 ID 非空且同批唯一；不限制正文类型、结束原因或最终文本是否为空。工具是否存在、参数是否符合要求由执行器检查。合法就返回调用列表，非法就抛 `ModelResponseError`。
 
 随后 `await runtime.on_response(response)` 把整个模型响应存入 `history`，保留模型请求过哪个工具和对应编号。
 
@@ -427,13 +414,13 @@ response = AIMessage(
 
 ```mermaid
 flowchart TD
-    CALL["run_loop：取出一个 ToolCall<br/>name=read，args.path=README.md，id=call_1"] --> EXEC["await runtime.execute(call)"]
+    CALL["run_loop：取出一个 ToolCall<br/>name=read，args={path: README.md}，id=call_1"] --> EXEC["await runtime.execute(call)"]
     EXEC --> THREAD["await asyncio.to_thread(execute_tool, call, workspace)<br/>在线程中运行同步工具函数"]
-    THREAD --> DISPATCH["tools.execute_tool(call, workspace)<br/>检查工具名是否在定义表中"]
-    DISPATCH --> ARGS["ReadArgs.model_validate(call['args'])<br/>参数字典变成已校验的 ReadArgs"]
-    ARGS --> READ["read_file(args, workspace)<br/>检查路径、文件类型和大小，读取并解码 UTF-8"]
+    THREAD --> DISPATCH["tools.execute_tool(call, workspace)<br/>resolve_tool_call 按名称取得参数模型和执行函数"]
+    DISPATCH --> ARGS["args_model.model_validate(call['args'])<br/>read 的参数字典变成 ReadArgs"]
+    ARGS --> READ["handler(args, workspace)，此处为 read_file<br/>检查路径、文件类型和大小，读取并解码 UTF-8"]
     READ --> TEXT["返回文件正文 str"]
-    TEXT --> TOOLMSG["execute_tool 包装并返回 ToolMessage<br/>content=正文；name=read；tool_call_id=call_1"]
+    TEXT --> TOOLMSG["make_tool_message(call, content)<br/>execute_tool 返回 ToolMessage，沿用名称和调用 ID"]
     TOOLMSG --> PAIR["Runtime.execute 包装并返回 ToolExecution<br/>raw=结果深拷贝；result=结果消息"]
     PAIR --> BACK["回到 run_loop<br/>execution 接住 ToolExecution"]
 ```
@@ -443,10 +430,10 @@ flowchart TD
 回到 `run_loop` 后，三行代码各有职责：
 
 ```python
-await runtime.on_result(execution)       # 保存执行记录到 runtime.executions
-results.append(execution.result)         # 把结果放进本轮局部列表
+await runtime.on_result(execution)  # 保存执行记录到 runtime.executions
+results.append(execution.result)  # 把结果放进本轮局部列表
 # 本批所有工具执行完成后：
-await runtime.after_turn(results)        # 把整批结果写入 runtime.history
+await runtime.after_turn(results)  # 把整批结果写入 runtime.history
 ```
 
 **`on_result` 保存的是执行记录；`after_turn` 才把工具消息写进模型下一轮要读的历史。** 这几步都不会自动发送模型请求。
@@ -471,13 +458,13 @@ runtime.history = [
 
 ```text
 遇到 SystemMessage / HumanMessage → 当前没有欠缺工具结果，继续
-遇到 AIMessage → 调用 response_calls(message)，得到历史中的工具调用
+遇到 AIMessage → 直接读取 message.tool_calls，检查编号并登记待返回结果的调用
               → pending = {"call_1": "read"}
 遇到 ToolMessage → 核对 tool_call_id 与 name，然后删除对应 pending
 遍历结束 → pending 为空，校验通过，返回 None
 ```
 
-因此 `response_calls` 有两个调用位置：收到新响应后由 `run_loop` 调用；检查历史中的 AIMessage 时由 `validate_history` 调用。后一个位置只检查已有记录，不会重新执行工具，也不会再次请求模型。
+`run_loop` 收到新响应后调用 `response_calls`；`validate_history` 只检查历史配对，不再复用新响应校验。独立的摘要请求不经过主循环，因此自己调用 `response_calls`。
 
 假设第二轮模型返回 `AIMessage(content="对 README 目标的概括……", tool_calls=[], response_metadata={"finish_reason": "stop"})`，后续顺序是：
 
@@ -488,7 +475,7 @@ runtime.history = [
 5. 离开模型资源上下文，关闭客户端；执行 `finally` 中的 `await runtime.finish(status, reason)`。
 6. 收尾正常完成后，答案字符串返回 `run_agent`，再由 `asyncio.run` 交给 `main` 的 `output`，最后 `print(output)`。
 
-**这次 Query 的最终概括仍由第二次 `request_once → request_with_tools → ainvoke` 生成。** 虽然 `ModelIO` 还保存了 `summarize_once`，Day 1 的 `run_loop` 没有调用它；不要因为用户要求“概括”就把它接到这条调用链上。
+**这次 Query 的最终概括仍由第二次 `request_once → ainvoke` 生成。** 虽然 `ModelIO` 还保存了 `summarize_once`，Day 1 的 `run_loop` 没有调用它；不要因为用户要求“概括”就把它接到这条调用链上。
 
 如果第一次请求就返回合法的最终文本，没有任何工具调用，则直接走上述收尾流程，不进入第二轮。
 

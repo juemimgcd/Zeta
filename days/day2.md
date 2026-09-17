@@ -29,7 +29,7 @@
 | 类 | 它是什么 | 属性是什么意思 |
 | --- | --- | --- |
 | `Decision` | 回调返回的决策数据，不会自己停止程序 | `stop`：是否提出拒绝/停止，默认 False；`reason`：理由，stop=True 时须非空。before_tool 拒绝本次工具，after_turn 停止运行 |
-| `ToolContext` | 执行工具前交给回调的数据 | `name`：工具名；`call_id`：本次调用编号；`path`：请求读取的路径，不代表读取成功 |
+| `ToolContext` | 执行工具前交给回调的数据 | `name`：工具名；`call_id`：本次调用编号；`args`：校验后的工具参数字典；read 的路径在 `args["path"]` 中 |
 | `Hooks` | 保存并调用扩展函数的管理器 | `callbacks`：Hook 名 → 按注册顺序排列的函数列表，存的是函数本身 |
 | `Event` | 一份事件通知 | `kind`：事件名；`detail`：补充说明；`call_id`：关联工具调用编号，不涉及工具时可为空 |
 | `HookRuntime` | 继承 Runtime，在已有位置加入 Hook 和事件 | 新增 `hooks`：回调管理器；`listeners`：事件监听函数序列。继承属性见 [基础代码](support.md#先认识基础代码中的类与函数) |
@@ -71,7 +71,7 @@ Decision、ToolContext、Event 的 `@dataclass(frozen=True)` 自动生成初始�
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -97,7 +97,7 @@ class Decision:
 class ToolContext:
     name: str
     call_id: str
-    path: str
+    args: dict[str, Any]
 
 
 type HookContext = list[BaseMessage] | AIMessage | ToolContext | ToolMessage
@@ -179,12 +179,11 @@ from copy import deepcopy
 from pathlib import Path
 
 from langchain_core.messages import ToolCall, ToolMessage
-from pydantic import ValidationError
 
 from zeta.hooks import Decision, Hooks, ToolContext
 from zeta.lifecycle import Event, Listener, emit
 from zeta.runtime_base import ToolExecution
-from zeta.tools import ReadArgs, ToolError, read_file
+from zeta.tools import ToolError, make_tool_message, resolve_tool_call
 
 
 async def execute_tool(
@@ -299,7 +298,7 @@ class HookRuntime(Runtime):
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -325,7 +324,7 @@ class Decision:
 class ToolContext:
     name: str
     call_id: str
-    path: str
+    args: dict[str, Any]
 
 
 type HookContext = list[BaseMessage] | AIMessage | ToolContext | ToolMessage
@@ -359,6 +358,7 @@ class Hooks:
             result = await callback(deepcopy(current))
             if result is None:
                 continue
+            # 按常见生命周期顺序排列；每次 invoke 只处理 name 指定的 Hook。
             if name == "before_model":
                 if not isinstance(current, list) or not isinstance(result, list):
                     raise TypeError("before_model must return a message list")
@@ -377,6 +377,16 @@ class Hooks:
                         )
                 validate_history(result)
                 current = deepcopy(result)
+            elif name == "after_model":
+                # None 已在上面处理；观察回调不能返回替换数据。
+                raise TypeError("after_model is read-only and must return None")
+            elif name == "before_tool":
+                if not isinstance(result, Decision):
+                    raise TypeError("decision hook must return Decision")
+                if result.stop:
+                    if not result.reason.strip():
+                        raise ValueError("a stop/deny decision needs a reason")
+                    return result
             elif name == "after_tool":
                 if not isinstance(current, ToolMessage) or not isinstance(
                     result, ToolMessage
@@ -395,15 +405,13 @@ class Hooks:
                 ):
                     raise ValueError("hook changed tool result identity or outcome")
                 current = deepcopy(result)
-            elif name in ("before_tool", "after_turn"):
+            elif name == "after_turn":
                 if not isinstance(result, Decision):
                     raise TypeError("decision hook must return Decision")
                 if result.stop:
                     if not result.reason.strip():
                         raise ValueError("a stop/deny decision needs a reason")
                     return result
-            else:
-                raise TypeError("after_model is read-only and must return None")
         if name in ("before_tool", "after_turn"):
             return Decision()
         if name == "after_model":
@@ -465,12 +473,11 @@ from copy import deepcopy
 from pathlib import Path
 
 from langchain_core.messages import ToolCall, ToolMessage
-from pydantic import ValidationError
 
 from zeta.hooks import Decision, Hooks, ToolContext
 from zeta.lifecycle import Event, Listener, emit
 from zeta.runtime_base import ToolExecution
-from zeta.tools import ReadArgs, ToolError, read_file
+from zeta.tools import ToolError, make_tool_message, resolve_tool_call
 
 
 async def execute_tool(
@@ -479,54 +486,28 @@ async def execute_tool(
     hooks: Hooks,
     listeners: Sequence[Listener] = (),
 ) -> ToolExecution:
-    raw: ToolMessage | None = None
-    args: ReadArgs | None = None
+    raw: ToolMessage
     try:
-        if call["name"] != "read":
-            raise ToolError("unknown tool")
-        args = ReadArgs.model_validate(call["args"])
-    except ValidationError, ToolError:
-        raw = ToolMessage(
-            name=call["name"],
-            tool_call_id=(call["id"] or ""),
-            content="unknown tool or invalid read arguments",
-            status="error",
-            artifact={"outcome": "failed"},
-        )
-    if args is not None:
+        handler, args = resolve_tool_call(call)
+    except ToolError as error:
+        raw = make_tool_message(call, str(error), "failed")
+    else:
         decision = await hooks.invoke(
-            "before_tool", ToolContext(call["name"], (call["id"] or ""), args.path)
+            "before_tool",
+            ToolContext(call["name"], (call["id"] or ""), args.model_dump(mode="json")),
         )
         if not isinstance(decision, Decision):
             raise TypeError("missing tool decision")
         if decision.stop:
-            raw = ToolMessage(
-                name=call["name"],
-                tool_call_id=(call["id"] or ""),
-                content=decision.reason,
-                status="error",
-                artifact={"outcome": "denied"},
-            )
+            raw = make_tool_message(call, decision.reason, "denied")
         else:
             await emit(Event("tool_start", call["name"], (call["id"] or "")), listeners)
             try:
-                content = await asyncio.to_thread(read_file, args, workspace)
+                content = await asyncio.to_thread(handler, args, workspace)
             except ToolError as error:
-                raw = ToolMessage(
-                    name=call["name"],
-                    tool_call_id=(call["id"] or ""),
-                    content=str(error),
-                    status="error",
-                    artifact={"outcome": "failed"},
-                )
+                raw = make_tool_message(call, str(error), "failed")
             else:
-                raw = ToolMessage(
-                    name=call["name"],
-                    tool_call_id=(call["id"] or ""),
-                    content=content,
-                )
-    if raw is None:
-        raise RuntimeError("missing raw tool result")
+                raw = make_tool_message(call, content)
     result = await hooks.invoke("after_tool", raw)
     if not isinstance(result, ToolMessage):
         raise TypeError("missing final tool result")
@@ -623,7 +604,7 @@ class HookRuntime(Runtime):
 
 ## LangChain 类型对应关系
 
-before_model 的列表改为 BaseMessage 序列，只能前置非空 HumanMessage 参考资料，不能改已有消息或插入 SystemMessage。after_tool 使用 ToolMessage，name、tool_call_id、status 和 artifact 都保持原值，只有正文可以处理。ToolCall 的 args 已是字典，仍使用 Pydantic ReadArgs 校验。
+before_model 的列表改为 BaseMessage 序列，只能前置非空 HumanMessage 参考资料，不能改已有消息或插入 SystemMessage。after_tool 使用 ToolMessage，name、tool_call_id、status 和 artifact 都保持原值，只有正文可以处理。ToolCall 的 args 已是字典，由注册工具的 Pydantic 参数模型校验；read 对应 ReadArgs。
 
 ## 与前后单元的关系
 
@@ -658,7 +639,7 @@ from zeta.hooks import Decision, HookContext, Hooks, ToolContext
 async def block_draft(context: HookContext) -> Decision:
     if not isinstance(context, ToolContext):
         raise TypeError("block_draft needs ToolContext")
-    if Path(context.path).name == "draft.txt":
+    if context.name == "read" and Path(context.args["path"]).name == "draft.txt":
         return Decision(stop=True, reason="本次任务不读取草稿")
     return Decision()  # 默认 stop=False，允许继续。
 
@@ -749,16 +730,16 @@ flowchart TD
     B --> P["prepare()<br/>父类准备消息 → apply_before_model()"]
     P --> H1["① invoke(before_model, messages)<br/>执行已注册的输入处理回调，取得最终消息列表"]
     H1 --> V["run_loop：validate_history(messages)<br/>计入请求次数"]
-    V --> REQ["io.request → request_once → request_with_tools<br/>await ainvoke，得到完整 AIMessage"]
+    V --> REQ["io.request → request_once<br/>await ainvoke，得到完整 AIMessage"]
     REQ --> RC["run_loop：response_calls(response)<br/>校验响应，取出 calls"]
     RC --> SAVE["HookRuntime.on_response(response)<br/>父类先把响应加入 history"]
     SAVE --> H2["② invoke(after_model, response)<br/>执行观察回调；之后通知 model_response"]
     H2 --> HAS{"模型要求工具？"}
-    HAS -->|有，预算允许| EX["逐个 HookRuntime.execute(call)<br/>进入 dispatch.execute_tool，先校验名称与参数"]
+    HAS -->|有，预算允许| EX["逐个 HookRuntime.execute(call)<br/>进入 dispatch.execute_tool<br/>resolve_tool_call 返回 handler 和 args"]
     EX --> H3["③ invoke(before_tool, ToolContext)<br/>执行 block_draft，取得 Decision"]
     H3 --> DEC{"允许本次工具？"}
-    DEC -->|允许| READ["通知 tool_start<br/>await to_thread(read_file, args, workspace)<br/>正文包装为 raw ToolMessage"]
-    DEC -->|拒绝| DENY["不读取文件<br/>拒绝理由包装为 raw ToolMessage"]
+    DEC -->|允许| READ["通知 tool_start<br/>await to_thread(handler, args, workspace)<br/>make_tool_message 包装为 raw ToolMessage"]
+    DEC -->|拒绝| DENY["不读取文件<br/>make_tool_message(call, reason, denied) 生成 raw"]
     READ --> H4["④ invoke(after_tool, raw)<br/>取得最终 ToolMessage，返回 ToolExecution"]
     DENY --> H4
     H4 --> RECORD["on_result(execution)<br/>父类保存执行记录；通知 tool_end<br/>循环收集 result"]
@@ -841,3 +822,35 @@ Hook 的返回值可以参与决策或改变被采用的数据；Event 用来通
 因此，拒绝读取时没有 `tool_start`，但有结果可记录，所以仍有 `tool_end`。通知发出了，也不等于终端自动出现日志；只有配置了会显示或记录通知的监听器，才有对应输出。
 
 Hook 的实际用途是让不同运行采用不同规则：这次注册“拒绝草稿”，下次可以注册另一条业务检查；仍由同一个 `run_loop` 和调度器负责请求模型、执行工具和回传结果。如果只有一条永远不变的规则，直接写在工具函数里也可以，Hook 并不是 Agent 能运行的前提。
+
+
+## 扩展工具：普通函数与一张显式表
+
+具体工具各自放在 `src/zeta/builtin_tools/` 下，保留参数模型和普通执行函数，不需要装饰器。
+在 `src/zeta/tools.py` 导入它们，再写入 `TOOLS`：
+
+```python
+TOOLS: dict[str, tuple[type[BaseModel], ToolHandler]] = {
+    "read": (ReadArgs, read_file),
+}
+```
+
+字典键是模型使用的工具名；值是一对对象：参数模型类和执行函数。
+`ReadArgs`、`read_file` 都不加括号，此处只是保存它们，不会校验参数或读取文件。
+新增工具时，在表中使用新的名称，配对对应的参数模型与函数即可。
+这是本地显式配置，不再执行装饰器注册检查；函数文档字符串提供模型说明，没有文档字符串时使用工具名。
+
+`tool_schemas()` 遍历表，生成名称、描述和参数 schema。
+`resolve_tool_call(call)` 按名称取出 `args_model, handler`，执行
+`args_model.model_validate(call["args"])` 后返回 `handler, args`。
+基础执行器随后调用 `handler(args, workspace)`；Hook 调度器先执行 `before_tool`，
+允许后通过 `asyncio.to_thread(handler, args, workspace)` 调用同一个函数。
+
+未知工具或参数无效仍抛出 `ToolError`；基础入口向外传递，Hook 入口转为失败结果。
+名称或参数校验失败时跳过 `before_tool`；参数错误、拒绝、执行失败和成功四条路径最终都把 raw 交给 `after_tool`。
+`make_tool_message(call, content, outcome)` 统一保留名称和调用 ID，并转换
+`success`、`failed`、`denied` 对应的消息状态与附加信息。
+
+`ToolError` 定义在 `builtin_tools/__init__.py`，具体工具和调度层共用。
+`tools.py` 导入它，原有 `from zeta.tools import ToolError` 仍可使用。
+包初始化无需导入所有工具；`tools.py` 加载时直接建立这张表。

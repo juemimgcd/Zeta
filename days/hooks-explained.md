@@ -56,8 +56,8 @@ async def check_path(context: HookContext) -> Decision:
     if not isinstance(context, ToolContext):
         raise TypeError("check_path needs ToolContext")
 
-    # context.path 是待读取路径，当前还没有执行读取。
-    if Path(context.path).name == ".env":
+    # read 的 args["path"] 是待读取路径，其他工具可以有不同参数。
+    if context.name == "read" and Path(context.args["path"]).name == ".env":
         # 返回决策数据；这里没有退出 Agent，也没有直接生成工具结果。
         return Decision(stop=True, reason="不允许读取 .env 文件")
 
@@ -76,11 +76,11 @@ hooks.register("before_tool", check_path)
 
 1. 循环拿到模型的 `ToolCall`，调用 `await runtime.execute(call)`。
 2. `runtime` 是 `HookRuntime` 实例，因此执行 `HookRuntime.execute`，它再调用 `dispatch.execute_tool`。
-3. 调度器先校验工具名与参数，然后构造 `ToolContext("read", "call_1", ".env")`。
+3. 调度器调用 `resolve_tool_call(call)`，取得执行函数 `handler` 和校验后的参数实例，再用 `args.model_dump(mode="json")` 构造 `ToolContext("read", "call_1", {"path": ".env"})`。
 4. 调度器调用 `await hooks.invoke("before_tool", context)`。
 5. `invoke` 从列表取出 `check_path`，传入上下文的深拷贝，等待其返回。
 6. `check_path` 返回 `Decision(stop=True, reason=...)`。`invoke` 检查理由非空，立即将决策返回给调度器。
-7. 调度器看到 `stop=True`，生成 `outcome="denied"` 的工具结果，不调用 `read_file`。
+7. 调度器看到 `stop=True`，调用 `make_tool_message(call, decision.reason, "denied")`，生成 status="error"、artifact={"outcome": "denied"} 的结果，不调用 `handler`（本例为 `read_file`）。
 8. 拒绝结果仍经过 `after_tool`，随后作为 `ToolExecution.result` 交回循环。
 9. 循环记录执行结果，发送 `tool_end`；这一批工具处理完后，把结果放进历史，供后续模型请求使用。
 
@@ -172,10 +172,11 @@ turn_start 事件
 → 保存模型响应
 → after_model Hook
 → model_response 事件
-→ 校验工具名和参数
+→ resolve_tool_call 查找参数模型和执行函数并校验参数
 → before_tool Hook
 → tool_start 事件
-→ 执行 read_file，生成 raw
+→ 执行 handler，本例为 read_file
+→ make_tool_message 包装正文，生成 raw
 → after_tool Hook，得到 result
 → 保存 ToolExecution 执行记录
 → tool_end 事件
@@ -227,7 +228,7 @@ context 是调用方在那个执行位置提供的数据；不必有 `.messages`
 | --- | --- | --- |
 | before_model | `[SystemMessage(content="固定指令"), HumanMessage(content="用户问题")]` | 新消息列表或 None |
 | after_model | `AIMessage(content="模型回答")` | 只能 None |
-| before_tool | `ToolContext(name="read", call_id="call_123", path="README.md")` | Decision 或 None |
+| before_tool | `ToolContext(name="read", call_id="call_123", args={"path": "README.md"})` | Decision 或 None |
 | after_tool | `ToolMessage(content="文件正文", name="read", tool_call_id="call_123")` | 新 ToolMessage 或 None |
 | after_turn | 包含用户、模型和已补齐工具结果的完整历史列表 | Decision 或 None |
 
@@ -277,7 +278,7 @@ if result is None:
     continue
 ```
 
-所以 after_model 回调观察响应并返回 None 时，直接继续下一个回调；只有返回了非 None 数据才会落入最后的 else，抛出“只读 Hook 必须返回 None”的错误。函数开头已经排除未知名称，其他四种 Hook 在前面的分支处理完，剩下的就是 after_model。
+所以 after_model 回调观察响应并返回 None 时，直接继续下一个回调；只有返回了非 None 数据才会进入显式的 `elif name == "after_model"` 分支，抛出“只读 Hook 必须返回 None”的错误。源码分支按 `before_model → after_model → before_tool → after_tool → after_turn` 排列，便于对照生命周期。一次 invoke 只处理 name 指定的那种 Hook；实际先后由循环和 Runtime/工具调度器的调用位置决定。
 
 即使回调修改了收到的副本，只要返回 None，管理器也不采用这次修改。复制只能隔离传入的数据，不能撤销回调自己写文件等外部副作用。
 

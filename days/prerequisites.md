@@ -230,17 +230,11 @@ ToolMessage(正文, tool_call_id=call_001)
 
 ### 8.2 finish_reason 在 response_metadata 中
 
-| 情况 | 本课要求 |
-| --- | --- |
-| 有 tool_calls | response_metadata["finish_reason"] 等于 `tool_calls` |
-| 无 tool_calls | finish_reason 等于 `stop`，且文字非空 |
-| length、缺少结束原因或其他值 | 拒绝执行，向外报错 |
-
-这里的 `tool_calls` 是服务商结束原因，不是旧框架的单数 `tool_call`。响应完整不代表任务已经结束，有合法工具调用时还需要循环。
+`finish_reason` 是服务商返回的结束原因。本课简化版不要求它与 `tool_calls` 精确匹配，也不因缺少这个字段而拒绝响应。循环直接根据 `response.tool_calls` 决定是否执行工具；没有调用时返回 `response.text`，允许为空。因此，这个校验不保证最终文字完整或非空。
 
 ### 8.3 对照你的函数
 
-response_calls 同时检查消息形态、调用 ID 和结束原因。异常统一用 Zeta 的 ModelResponseError 表达。工具状态则属于 ToolMessage.status；运行状态属于 Runtime 的 RunStatus，不能相互混用。
+response_calls 只拒绝流式片段、未解析调用，以及空白或同批重复的调用 ID。工具名和参数由执行器处理。工具状态属于 ToolMessage.status；运行状态属于 Runtime 的 RunStatus，不能相互混用。
 
 ## 9. 模型怎么知道有 read：工具说明与真正执行工具的区别
 
@@ -250,17 +244,19 @@ ReadArgs 仍继承 BaseModel，path 使用 Field，ConfigDict(extra="forbid", st
 
 ### 9.2 args 已由 LangChain 解析成字典
 
-`ReadArgs.model_validate(call["args"])` 校验工具参数。旧版根据字符串/字典选择 model_validate_json 的分支不再需要。解析 JSON 失败的调用会出现在 invalid_tool_calls，先由 response_calls 拒绝。
+`resolve_tool_call(call)` 先按工具名从 `TOOLS` 取出 `args_model, handler`，再调用 `args_model.model_validate(call["args"])`。read 对应的参数模型是 `ReadArgs`。旧版根据字符串/字典选择 model_validate_json 的分支不再需要。解析 JSON 失败的调用会出现在 invalid_tool_calls，先由 response_calls 拒绝。
 
 ### 9.3 model_json_schema() 仍是给模型看的结构说明
 
-TOOL_DEFINITIONS 现在用原生函数工具 schema 字典，function 中保存 name、description、parameters。parameters 仍来自 ReadArgs.model_json_schema()。
+`TOOLS` 是普通字典：`{"read": (ReadArgs, read_file)}`。`args_model, handler = TOOLS["read"]` 把这一对对象取出来，分别得到参数模型类和执行函数。函数文档字符串提供 description；没有文档字符串时使用工具名。
 
-model.bind_tools(list(TOOL_DEFINITIONS.values())) 仅把这些说明附到请求。它没有收到 read_file 的执行结果，也不代替本地 ReadArgs 校验、权限检查和读取。
+`tool_schemas()` 从注册表生成给模型的 schema 字典列表，function 中保存 name、description、parameters；parameters 来自 `args_model.model_json_schema()`。对于 read，这就是 `ReadArgs.model_json_schema()`。
+
+model.bind_tools(tool_schemas()) 仅把这些说明附到请求。它没有收到 read_file 的执行结果，也不代替本地 ReadArgs 校验、权限检查和读取。
 
 ### 9.4 read_file 中的标准库操作不变
 
-Path.resolve 解析路径与符号链接，is_relative_to 检查工作区，is_file 检查普通文件；open("rb") 按字节读取，超过 32768 字节拒绝，最后用 UTF-8 解码。原版 read_file 的实现保留在 support，不在此另写一版。
+Path.resolve 解析路径与符号链接，is_relative_to 检查工作区，is_file 检查普通文件；open("rb") 按字节读取，超过 32768 字节拒绝，最后用 UTF-8 解码。`read_file` 位于 `builtin_tools/read.py`，完整代码见 support，不在此另写一版。
 
 ## 10. ainvoke、request_once 和消息类型分别是什么
 
@@ -273,10 +269,10 @@ ChatOpenAI 是 LangChain 的模型客户端。创建对象和 bind_tools 都不�
 | 内容 | 来自哪里 |
 | --- | --- |
 | 消息列表 | Runtime.prepare 或 ContextRuntime.prepare |
-| 工具说明 | request_once 提供 READ 工具 schema；摘要/规划/汇总为空 |
-| 模型与设置 | create_model 指定模型、超时、禁用自动重试和非思考模式；每次请求传 max_tokens |
+| 工具说明 | request_once 默认提供全部已注册工具 schema，目前内置 read；摘要/规划/汇总显式传空序列 |
+| 模型与设置 | create_model 指定模型、地址、超时并禁用自动重试与缓存；每次请求传 max_tokens；不设置厂商专用 thinking 参数 |
 
-对外仍是 request_once(model, history, *, max_tokens=2048)。request_with_tools 只是接入内部共用的单次请求函数，不做工具调度或自动续跑。
+单次请求统一使用 `request_once(model, history, *, tools=None, max_tokens=2048)`：默认携带已注册工具，传入空序列则不带工具，传入指定列表则使用该列表。函数直接请求模型，不做工具调度或自动续跑。
 
 ### 10.3 response 还保存什么
 
@@ -524,12 +520,12 @@ asyncio.run(run_agent(prompt, Path.cwd()))
 
 ### 14.1 先排除片段与非法参数
 
-检查 isinstance(response, AIMessageChunk) 和 response.invalid_tool_calls。任何一项成立都抛 ModelResponseError。随后要求 content 是字符串，这是本课的非思考文字模式边界。
+检查 isinstance(response, AIMessageChunk) 和 response.invalid_tool_calls。任何一项成立都抛 ModelResponseError；不再限制 content 必须是字符串。
 
 ### 14.2 直接取出 LangChain 已解析的调用
 
 ```text
-calls = list(response.tool_calls)
+calls = response.tool_calls
 ```
 
 不再从混合 parts 里按 ToolCall 类型筛选。列表中的元素仍是原调用字典；只有文字时得到空列表。
@@ -544,14 +540,9 @@ len(ids) != len(set(ids))
 
 第一项排除 None、空字符串和全空格，第二项排除同批重复。检查不会把合法 ID 改写成 strip 后的字符串。
 
-### 14.4 结束原因必须与内容一致
+### 14.4 返回调用列表
 
-```text
-expected_reason = "tool_calls" if calls else "stop"
-response.response_metadata.get("finish_reason") != expected_reason
-```
-
-不匹配就拒绝。没有工具调用时，还要求 response.text.strip() 非空。最后 return calls，有调用返回列表，正常最终回答返回 []。
+最后 `return calls`。有调用就返回列表，没有调用就返回 `[]`。不再检查工具名非空、正文类型、结束原因或最终文字非空；未知工具和参数错误由执行器处理。
 
 ## 15. 逐行读 validate_history：pending 是“还欠着哪些结果”
 
@@ -561,20 +552,21 @@ pending: dict[str, str] 的键是调用 ID，值是工具名。例如 {"call_001
 
 ### 15.2 看见 AIMessage 时登记调用
 
-先要求上一批 pending 为空，再用 response_calls 复用响应检查，把 call["id"] 和 call["name"] 登记进去。无调用的最终响应不增加 pending。
+先要求上一批 pending 为空，再读取 message.tool_calls，检查编号非空且同批唯一，把 call["id"] 和 call["name"] 登记进去。这里不重新检查旧响应的正文或元数据。无调用的最终响应不增加 pending。
 
 ### 15.3 看见 ToolMessage 时核销结果
 
 ```text
-elif isinstance(message, ToolMessage):
+if isinstance(message, ToolMessage):
     if pending.get(message.tool_call_id) != message.name:
         raise ValueError("unmatched tool result")
     del pending[message.tool_call_id]
+    continue
 ```
 
 ToolMessage 本身就是结果消息，所以这一层直接检查 message，不遍历 message.parts。没有编号、重复结果或工具名称不一致都会拒绝。
 
-遇到 HumanMessage / SystemMessage 时，如果 pending 还非空，也拒绝在工具批次中插入普通消息。其他消息类型不在本课协议范围内。
+处理完 ToolMessage 后用 continue 进入下一条消息。所有非 ToolMessage 共用一个 pending 检查，避免分别为 AIMessage、HumanMessage 和 SystemMessage 写相同分支。函数只负责配对，不再额外限制消息类型。
 
 ### 15.4 手动跟踪 pending
 
@@ -652,7 +644,7 @@ await runtime.after_turn(results)
 
 ### 16.6 最终文字与终态
 
-没有调用时，前面的 response_calls 已确认有可用文字。循环设置 `status="completed"`，返回 `response.text or ""`。
+没有调用时，循环设置 `status="completed"`，返回 `response.text or ""`。
 
 本代码中的状态名称属于不同对象：
 
@@ -716,8 +708,11 @@ LangChain 这里没有旧版的 complete 状态字段；completed 仍是 Zeta �
 | `loop_common.py: validate_history` | 已有调用是否都有对应结果？ |
 | `runtime_base.py: Runtime` | 历史、计数器放在哪，各步骤如何改变它们？ |
 | `model_io.py: request_once` | 用什么工具定义和设置发送一次请求？ |
-| `tools.py: execute_tool` | 怎样从 ToolCall 选工具并校验参数？ |
-| `tools.py: read_file` | 哪一行真正读取了本机文件？ |
+| `tools.py: resolve_tool_call / execute_tool` | 怎样按名称取得参数模型和函数、校验参数并执行 handler？ |
+| `tools.py: make_tool_message` | 怎样把正文和调用编号包装成工具结果？ |
+| `builtin_tools/read.py: ReadArgs / read_file` | read 接收哪些参数，哪一行真正读取了本机文件？ |
+| `tools.py: TOOLS` | 工具名对应哪个参数模型和执行函数，新增工具在哪里加一项？ |
+| `builtin_tools/__init__.py: ToolError` | 具体工具和调度层如何共用同一种预期错误？ |
 
 这些位置描述的是 Day 1 和 support.md 组合后的目标代码。有些文件可能尚未由你在 src 中准备完成；文档有完整代码不代表当前 CLI 已经跑通。
 

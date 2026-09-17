@@ -8,6 +8,7 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    ToolCall,
     ToolMessage,
     messages_from_dict,
     messages_to_dict,
@@ -46,20 +47,18 @@ def encode(messages: Sequence[BaseMessage]) -> str:
 def decode(entry: Entry) -> BaseMessage:
     payload = TypeAdapter(dict[str, Any]).validate_json(entry.message_json)
     if payload.get("format") != "langchain-messages-v1":
-        raise ValueError(
-            "unsupported message format; old sessions need explicit migration"
-        )
+        raise ValueError
     data = TypeAdapter(list[dict[str, Any]]).validate_python(payload["messages"])
     messages = messages_from_dict(data)
     if len(messages) != 1:
-        raise ValueError("an entry must contain exactly one message")
+        raise ValueError
     return messages[0]
 
 
 def load_session(store: JsonStore, session_id: str) -> SessionData:
     body = store.get("session", session_id)
-    if body is None:
-        raise KeyError("unknown session")
+    if not body:
+        raise ValueError
     return SessionData.model_validate_json(body)
 
 
@@ -69,61 +68,69 @@ def save_session(store: JsonStore, session: SessionData) -> None:
 
 def create_session(store: JsonStore, scope: str) -> str:
     if not scope.strip():
-        raise ValueError("scope is required")
-    session = SessionData(id=uuid4().hex, scope=scope)
-    with store.transaction():
-        save_session(store, session)
+        raise ValueError
+    session = SessionData(
+        id=uuid4().hex,
+        scope=scope,
+    )
+    save_session(store, session)
     return session.id
+
 
 
 def append_user(store: JsonStore, session_id: str, prompt: str) -> str:
     if not prompt.strip():
-        raise ValueError("empty prompt")
+        raise ValueError
     with store.transaction():
         session = load_session(store, session_id)
-        if session.pending or session.status not in ("ready", "completed"):
-            raise ValueError("finish the existing run or create a new session first")
+        if session.pending or session.status not in ("completed","ready"):
+            raise ValueError
         if session.entries:
             last = decode(session.entries[-1])
-            if not isinstance(last, AIMessage) or last.tool_calls:
-                raise ValueError("previous task has no final response")
-        entry = Entry(message_json=encode([HumanMessage(content=prompt)]))
+            if not isinstance(last,AIMessage) or last.tool_calls:
+                raise ValueError
+        entry = Entry(
+            message_json=encode([HumanMessage(content=prompt)])
+        )
         session.entries.append(entry)
-        session.status, session.reason = ("running", "")
+        session.status,session.reason = "running",""
         save_session(store, session)
-    return entry.id
+    return session.id
+
+
 
 
 def commit_response(store: JsonStore, session_id: str, response: AIMessage) -> str:
-    """Persist a response already validated by the loop; enforce session state."""
     calls = response.tool_calls
     with store.transaction():
         session = load_session(store, session_id)
         if session.pending or session.status != "running":
-            raise ValueError("session is not ready for a response")
-        if not session.entries or not isinstance(
-            decode(session.entries[-1]), (HumanMessage, ToolMessage)
-        ):
-            raise ValueError("response must follow user input or a tool-result batch")
-        entry = Entry(message_json=encode([response]))
+            raise ValueError
+        if session.entries:
+            last = decode(session.entries[-1])
+            if not isinstance(last,(HumanMessage,ToolMessage)):
+                raise ValueError
+        entry = Entry(
+            message_json=encode([response])
+        )
         session.entries.append(entry)
-        session.pending = {(call["id"] or ""): call["name"] for call in calls}
+        session.pending = {(call["id"] or ""):call["name"] for call in calls}
         save_session(store, session)
-    return entry.id
+    return session.id
+
 
 
 def commit_tool_result(
-    store: JsonStore,
-    session_id: str,
-    result: ToolMessage,
-    raw: ToolMessage | None = None,
+        store: JsonStore,
+        session_id: str,
+        result: ToolMessage,
+        raw: ToolMessage | None = None,
 ) -> str:
-    """Persist results already checked by after_tool; enforce pending state."""
     original = result if raw is None else raw
     with store.transaction():
         session = load_session(store, session_id)
-        if session.pending.get(result.tool_call_id) != result.name:
-            raise ValueError("unknown or already committed tool result")
+        if session.pending.get(result.tool_call_id)!=result.name:
+            raise ValueError
         entry = Entry(
             message_json=encode([result]),
             raw_json=encode([original]),
@@ -131,14 +138,14 @@ def commit_tool_result(
         session.entries.append(entry)
         del session.pending[result.tool_call_id]
         save_session(store, session)
-    return entry.id
+    return session.id
 
 
 def finish_session(
-    store: JsonStore,
-    session_id: str,
-    status: Literal["completed", "stopped", "failed", "cancelled"],
-    reason: str = "",
+        store: JsonStore,
+        session_id: str,
+        status: Literal["completed", "stopped", "failed", "cancelled"],
+        reason: str = "",
 ) -> None:
     with store.transaction():
         session = load_session(store, session_id)
@@ -146,6 +153,7 @@ def finish_session(
             raise ValueError("cannot complete a pending batch")
         session.status, session.reason = (status, reason)
         save_session(store, session)
+
 
 
 def history_messages(entries: Sequence[Entry]) -> list[BaseMessage]:

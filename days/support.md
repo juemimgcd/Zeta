@@ -6,7 +6,7 @@
 
 ## 接入迁移范围
 
-基准是 [GitHub 原版 9359d5f](https://github.com/juemimgcd/Zeta/tree/9359d5fadadaf82ef42ae600be22d565cf72a984/days)。保留原课程的 Runtime、异步方法、SQLite、Hooks 与并发 Worker，只替换模型框架及其消息/工具/序列化接口。Pydantic 的 BaseModel、ReadArgs 和业务数据校验仍保留。
+基准是 [GitHub 原版 9359d5f](https://github.com/juemimgcd/Zeta/tree/9359d5fadadaf82ef42ae600be22d565cf72a984/days)。保留原课程的 Runtime、异步方法、SQLite、Hooks 与并发 Worker；模型接入使用 LangChain，并同步当前工具注册和单次请求接口。Pydantic 的 BaseModel、ReadArgs 和业务数据校验仍保留。
 
 项目已安装以下接入依赖；重新添加时可执行：
 
@@ -28,7 +28,7 @@ LLM_API_KEY=你的密钥
 
 `create_model` 保留可用于 `async with` 的工厂接口，但现在是我们提供的 `@asynccontextmanager`：进入后得到 ChatOpenAI，退出时关闭所持有的 HTTP 客户端。不能把原先模型对象的上下文管理能力直接假定到 LangChain 上。
 
-`request_with_tools` 是接入层内部的单次请求助手；`request_once` 仍是原来的对外签名，带 read 定义。摘要、Manager 规划和汇总使用空工具列表。`max_retries=0` 防止库内重试绕过 Zeta 预算；`cache=False` 保持每次请求尝试的计数口径。
+`request_once` 直接完成一次请求，默认携带已注册工具定义（`tools=None`）；显式传入 `tools=()` 或 `tools=[]` 时不携带工具，也可以传入指定工具列表。摘要、Manager 规划和汇总显式使用空工具列表。`max_retries=0` 防止库内重试绕过 Zeta 预算；`cache=False` 保持每次请求尝试的计数口径。
 
 原 `ToolReturnPart.outcome` 在 LangChain 中拆成 `ToolMessage.status`（success/error）和本地 `artifact` 中的拒绝/失败标记。Hook 和 Session 检查 name、tool_call_id、status、artifact，仍只允许处理正文；tool_end 通过提供的 tool_outcome 恢复原 success/failed/denied 事件值。artifact 由本地保存，不作为发给模型的正文。
 
@@ -38,7 +38,7 @@ LLM_API_KEY=你的密钥
 
 | 归属 | 文件 | 后续如何使用 |
 | --- | --- | --- |
-| 本配套文档 | app.py、runtime_base.py、model_io.py、tools.py、cli.py、storage.py | 一次准备，之后保持不变 |
+| 本配套文档 | app.py、runtime_base.py、model_io.py、tools.py、builtin_tools/read.py、builtin_tools/__init__.py、__init__.py、cli.py、storage.py | 基础代码统一准备，后续单元直接复用 |
 | Day 1 | loop_common.py、loop.py | 唯一协议检查与唯一 run_loop，全部后续单元复用 |
 | Day 2 | hooks.py、lifecycle.py、dispatch.py、hook_runtime.py | 新增 Hook/事件/调度，无需改 Day 1 |
 | Day 3 | session.py、session_runtime.py | 新增提交/恢复，无需改 Day 1/2 |
@@ -48,7 +48,7 @@ LLM_API_KEY=你的密钥
 | Day 7 | integration.py | 组装前面能力，调用既有 run_loop |
 | Day 8 | team_budget.py、orchestration.py | Worker 复用 Day 7，不修改父级接口 |
 
-ReadArgs 和 read_file 保留旧版本的 Pydantic 校验与文件读取；工具说明和结果类型需按下方完整 tools.py 改为 LangChain 写法。Day 2 的异步调度放在新文件 dispatch.py，不覆盖基础工具实现。包的 __init__.py 沿用当前项目；模型接入依赖见下方迁移说明。
+`ReadArgs` 和普通函数 `read_file` 位于 `builtin_tools/read.py`；`tools.py` 直接导入它们，在 `TOOLS` 中保存工具名与（参数模型，执行函数）的对应关系，并提供参数解析和结果包装。`ToolError` 定义在 `builtin_tools/__init__.py`，避免具体工具反向依赖调度模块。包的 `__init__.py` 只负责版本信息。Day 2 的 `dispatch.py` 复用这些公共函数。
 
 ## 固定入口怎么扩展
 
@@ -82,11 +82,11 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 | `RunOptions` | 一次运行的限制配置 | `max_requests`：请求次数上限；`max_tool_calls`：工具调用次数上限；`timeout`：整次运行超时秒数；`output_tokens`：单次请求输出上限 |
 | `ToolExecution` | 同一次工具执行的原始/最终结果对 | `raw`：Hook 处理前的 ToolMessage；`result`：交回模型的最终 ToolMessage；处理 result 不会自动清除 raw |
 | `Runtime` | 循环调用的行为对象，后续通过子类增加能力 | 具体实例属性见下一张表 |
-| `ToolError` | 参数、路径、读取等预期工具失败的异常 | 无新增业务属性，构造参数保存原因，由调用方转换为工具结果 |
+| `ToolError` | 参数、路径、读取等预期工具失败的异常 | 构造参数保存原因；基础 Runtime 向外抛出，Day 2 调度器转换为失败结果 |
 | `ReadArgs` | read 工具的 Pydantic 参数模型 | `path`：非空路径字符串；`model_config`：严格类型、禁止额外字段的类配置；模型校验不替代实际路径检查 |
 | `JsonStore` | 在 SQLite 中按类别和编号保存 JSON 字符串的存储对象 | `connection`：SQLite 连接。名字叫 JsonStore，但存储文件是 SQLite 数据库 |
 
-`SummaryFn`、`RunStatus`、`ToolSchema` 都是类型别名：分别描述摘要函数、四种运行终态、工具定义字典；不是需要实例化的新类。`@dataclass` 为 ModelIO、RunOptions、ToolExecution 生成初始化等方法，frozen=True 禁止直接重赋字段。
+`SummaryFn`、`RunStatus`、`ToolSchema`、`ToolHandler`、`ToolOutcome` 都是类型别名，分别描述摘要函数、运行终态、给模型的工具 schema 字典、工具执行函数和 success/failed/denied 结果标签。`TOOLS` 是普通字典，每项保存参数模型和执行函数；`ToolSchema` 是发给模型的说明，不包含执行函数。`@dataclass` 为 ModelIO、RunOptions、ToolExecution 生成初始化等方法，frozen=True 禁止直接重赋字段。
 
 | Runtime 属性 | 含义 |
 | --- | --- |
@@ -115,11 +115,13 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 | `Runtime.finish(status, reason)` | 结束扩展位置，基础版本无持久化或通知，返回 None |
 | `run_agent(prompt, workspace, runtime=...)` | 使用传入 Runtime 或创建默认对象，调用同一个 run_loop，返回最终回答字符串 |
 | `create_model()` | 被 asynccontextmanager 包装；配合 async with 创建并交出 ChatOpenAI，离开时关闭 HTTP 客户端；yield 交出模型，不是回答文字 |
-| `request_with_tools(model, history, tools=..., max_tokens=...)` | 按需绑定工具定义并 await 一次 ainvoke，返回 AIMessage；不替 Zeta 执行工具或循环 |
-| `request_once(model, history, max_tokens=...)` | 给 request_with_tools 带上本项目 read 定义，返回 AIMessage |
+| `request_once(model, history, tools=None, max_tokens=...)` | 默认绑定已注册工具定义，传空序列则禁用工具；await 一次 ainvoke，返回完整 AIMessage，不执行工具或循环 |
 | `summarize_once(prompt)` | 创建模型并发送无工具请求，校验后返回摘要正文字符串 |
+| `tool_schemas()` | 从注册表生成给模型的工具 schema 列表，不包含本地 handler |
+| `resolve_tool_call(call)` | 按名称从 TOOLS 取出 args_model 和 handler，用参数模型校验，返回 handler 和参数实例；未知工具或参数无效抛 ToolError |
+| `make_tool_message(call, content, outcome="success")` | 保留调用名称和 ID，统一构造成功、失败或拒绝的 ToolMessage；不负责捕获异常 |
 | `read_file(args, workspace)` | 接收已校验 ReadArgs 和目录，检查真实路径、大小等并读取 UTF-8 正文；返回字符串，预期失败抛 ToolError |
-| `tools.execute_tool(call, workspace)` | 基础同步调度：校验工具名/参数，读取并把预期错误转为 ToolMessage，返回结果消息；与 Day 2 带 Hook 的异步调度函数区分 |
+| `tools.execute_tool(call, workspace)` | 基础同步调度：resolve_tool_call → handler → make_tool_message；成功返回 ToolMessage，ToolError 向外抛出；Day 2 的异步调度才把预期工具错误包装为失败结果 |
 | `tool_outcome(message)` | 从 artifact.outcome 或消息 status 得到可显示的结果标签，返回字符串 |
 | `main()` | CLI 入口，解析参数并启动异步运行，输出回答或错误；返回 None |
 | `JsonStore.__init__(path)` | 创建父目录、打开连接、建立 documents 表并提交初始化 |
@@ -128,6 +130,18 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 | `JsonStore.put(kind, key, body)` | 写入或覆盖 JSON 字符串，事务提交由调用方负责；返回 None |
 | `JsonStore.all(kind)` | 返回某类别下按编号排序的 JSON 字符串列表 |
 | `JsonStore.close()` | 关闭数据库连接，返回 None |
+
+## 模型请求中的工具参数
+
+| 调用方式 | 发给模型的工具说明 |
+| --- | --- |
+| `request_once(model, history)` 或 `tools=None` | 当前注册表的全部工具，目前内置 read |
+| `request_once(model, history, tools=())` 或 `tools=[]` | 不携带工具；摘要、Manager 规划和汇总采用这种方式 |
+| `request_once(model, history, tools=selected_tools)` | 只使用传入列表，不额外合并注册表 |
+
+`ModelIO.request` 只是保存函数；默认指向 `request_once`，不增加一次模型请求。`request_once` 中一次 `ainvoke` 返回完整 `AIMessage`，由 Loop 检查和处理。`summarize_once` 不经过 Loop，所以自己调用 `response_calls` 检查响应，再拒绝意外工具调用并返回文本。
+
+`RequestFn` 只规定 Loop 需要的 model、messages、max_tokens，不要求所有替代函数都暴露 tools 参数。Day 8 的 `SharedBudget.request_read` 仍满足这个接口；它通过预算入口把工具列表交给 `request_once`。
 
 ## 一次提供的完整文件
 
@@ -290,7 +304,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from zeta.loop_common import ModelResponseError, response_calls
-from zeta.tools import TOOL_DEFINITIONS, ToolSchema
+from zeta.tools import ToolSchema, tool_schemas
 
 
 @asynccontextmanager
@@ -310,32 +324,22 @@ async def create_model() -> AsyncGenerator[ChatOpenAI]:
             )
 
 
-async def request_with_tools(
-    model: ChatOpenAI,
-    history: Sequence[BaseMessage],
-    *,
-    tools: Sequence[ToolSchema] = (),
-    max_tokens: int = 2048,
-) -> AIMessage:
-    requester = model.bind_tools(list(tools)) if tools else model  # pyright: ignore[reportUnknownMemberType]  # Upstream callback annotation contains Unknown.
-    response = await requester.ainvoke(list(history), max_tokens=max_tokens)
-    return response
-
-
 async def request_once(
     model: ChatOpenAI,
     history: Sequence[BaseMessage],
     *,
+    tools: Sequence[ToolSchema] | None = None,
     max_tokens: int = 2048,
 ) -> AIMessage:
-    return await request_with_tools(
-        model, history, tools=list(TOOL_DEFINITIONS.values()), max_tokens=max_tokens
-    )
+    """Request once; None uses registered tools, an empty sequence disables them."""
+    schemas = tool_schemas() if tools is None else list(tools)
+    requester = model.bind_tools(schemas) if schemas else model  # pyright: ignore[reportUnknownMemberType]  # Upstream callback annotation contains Unknown.
+    return await requester.ainvoke(list(history), max_tokens=max_tokens)
 
 
 async def summarize_once(prompt: str) -> str:
     async with create_model() as model:
-        response = await request_with_tools(model, [HumanMessage(content=prompt)])
+        response = await request_once(model, [HumanMessage(content=prompt)], tools=())
     if response_calls(response):
         raise ModelResponseError("summary unexpectedly requested tools")
     return response.text
@@ -343,48 +347,113 @@ async def summarize_once(prompt: str) -> str:
 
 ## 直接提供：src/zeta/tools.py
 
-仅工具协议类型适配，ReadArgs 与 read_file 沿用旧版；execute_tool 仍由 Runtime 调用，不交给 LangChain 自动执行。
+工具名到参数模型、函数的对应表与参数校验集中在 tools.py，具体读取逻辑放在 builtin_tools/read.py；execute_tool 仍由 Runtime 调用，不交给 LangChain 自动执行。
 
 ```python
-"""A fixed, workspace-scoped read tool."""
+"""Tool registration, argument validation, and workspace-scoped execution."""
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import ToolCall, ToolMessage
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
-# 读取文件的字节上限：32768 字节，不是 32768 个汉字。
+from zeta.builtin_tools import ToolError
+from zeta.builtin_tools.read import ReadArgs, read_file
+
+type ToolSchema = dict[str, Any]
+type ToolHandler = Callable[[Any, Path], str]
+type ToolOutcome = Literal["success", "failed", "denied"]
+
+
+# 工具名 →（参数模型，执行函数）；新增工具时在这里加一项。
+TOOLS: dict[str, tuple[type[BaseModel], ToolHandler]] = {
+    "read": (ReadArgs, read_file),
+}
+
+
+def tool_schemas() -> list[ToolSchema]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": handler.__doc__ or name,
+                "parameters": args_model.model_json_schema(),
+            },
+        }
+        for name, (args_model, handler) in TOOLS.items()
+    ]
+
+
+def resolve_tool_call(call: ToolCall) -> tuple[ToolHandler, BaseModel]:
+    """Find the tool and validate model-supplied arguments once."""
+    definition = TOOLS.get(call["name"])
+    if definition is None:
+        raise ToolError(f"unknown tool: {call['name']}")
+    args_model, handler = definition
+    try:
+        args = args_model.model_validate(call["args"])
+    except ValidationError:
+        raise ToolError(f"invalid arguments for tool: {call['name']}") from None
+    return handler, args
+
+
+def make_tool_message(
+    call: ToolCall, content: str, outcome: ToolOutcome = "success"
+) -> ToolMessage:
+    return ToolMessage(
+        name=call["name"],
+        tool_call_id=(call["id"] or ""),
+        content=content,
+        status="success" if outcome == "success" else "error",
+        artifact=None if outcome == "success" else {"outcome": outcome},
+    )
+
+
+def execute_tool(call: ToolCall, workspace: Path) -> ToolMessage:
+    """Execute a tool; expected failures propagate to the base Runtime."""
+    handler, args = resolve_tool_call(call)
+    return make_tool_message(call, handler(args, workspace))
+
+
+def tool_outcome(message: ToolMessage) -> ToolOutcome:
+    """Retain the original success/failed/denied event vocabulary locally."""
+    if message.status == "success":
+        return "success"
+    return "denied" if message.artifact == {"outcome": "denied"} else "failed"
+```
+
+具体读取工具移到 `src/zeta/builtin_tools/read.py`：
+
+```python
+"""Read tool: metadata, arguments, and file-reading implementation."""
+
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from zeta.builtin_tools import ToolError
+
 MAX_READ_BYTES = 32_768
 
 
-# 预期工具错误：参数、路径或读取失败；供外层转换或显示，不表示正常结果。
-class ToolError(Exception):
-    """An expected tool failure safe to return to the caller."""
-
-
-# read 的参数模型，继承 Pydantic BaseModel 以获得运行时数据校验能力。
 class ReadArgs(BaseModel):
     """Arguments accepted by the read tool."""
 
-    # 拒绝额外参数，启用严格类型校验；模型提供的参数仍需经过本地验证。
     model_config = ConfigDict(extra="forbid", strict=True)
-    # 要读取的路径字符串，至少一个字符；路径是否存在和越界由 read_file 检查。
     path: str = Field(min_length=1, description="UTF-8 file path inside the workspace")
 
 
-# 输入已校验的 ReadArgs 和工作目录 Path，成功返回 UTF-8 文件正文字符串。
-# 只允许目录范围内的小型普通文件；拒绝 .git/.env 等路径，失败抛 ToolError。
 def read_file(args: ReadArgs, workspace: Path) -> str:
-    """Read a small UTF-8 regular file inside the workspace."""
+    """Read a UTF-8 workspace file of at most 32768 bytes."""
     try:
-        # 解析实际根路径，strict=True 要求它存在。
         root = workspace.resolve(strict=True)
-        # Path 的 / 运算符拼接路径；resolve 解析 .. 和符号链接后再判断是否越界。
+        # 解析 .. 和符号链接后再检查工作区边界。
         target = (root / args.path).resolve(strict=True)
         if not root.is_dir() or not target.is_relative_to(root):
             raise ToolError("path is outside the workspace")
-        # 取得相对路径；这里 relative.parts 是路径组件元组，不是模型响应 parts。
         relative = target.relative_to(root)
         if any(
             p == ".git" or p == ".env" or p.startswith(".env.") for p in relative.parts
@@ -392,69 +461,44 @@ def read_file(args: ReadArgs, workspace: Path) -> str:
             raise ToolError("reading this path is denied")
         if not target.is_file():
             raise ToolError("read requires a regular file")
-        # Trusted local workspace; use OS isolation for hostile concurrent changes.
-        # 二进制模式读取，以字节检查大小；with 结束时关闭文件。
-        # 此实现假设可信本地目录，不能防住恶意并发修改路径的所有情况。
+        # 假设可信本地目录；恶意并发修改路径需要 OS 隔离。
         with target.open("rb") as file:
-            # 多读取一个字节，用于区分“恰好达到上限”和“超过上限”。
+            # 多读一个字节以判断是否超限。
             data = file.read(MAX_READ_BYTES + 1)
         if len(data) > MAX_READ_BYTES:
             raise ToolError("file exceeds the 32768-byte read limit")
-        # 含零字节时按非文本拒绝；随后 decode 继续检查 UTF-8 编码是否合法。
         if b"\x00" in data:
             raise ToolError("read supports UTF-8 text only")
         return data.decode("utf-8")
-    # 把底层解码错误转换为可读的工具错误；from None 隐去异常链显示。
     except UnicodeError:
         raise ToolError("read supports UTF-8 text only") from None
     except OSError, ValueError, RuntimeError:
         raise ToolError("cannot read the requested workspace file") from None
-
-
-# 给模型看的工具说明表，键是工具名称；它不自动调用本地 read_file。
-type ToolSchema = dict[str, Any]
-TOOL_DEFINITIONS: dict[str, ToolSchema] = {
-    "read": {
-        "type": "function",
-        "function": {
-            "name": "read",
-            "description": "Read a UTF-8 workspace file of at most 32768 bytes.",
-            "parameters": ReadArgs.model_json_schema(),
-        },
-    }
-}
-
-
-# 接收模型给出的 ToolCall，校验名称/参数并执行 read，返回 ToolMessage。
-# Day 1 遇到预期失败会抛 ToolError 停止；这里尚不包装 failed 结果继续运行。
-def execute_tool(call: ToolCall, workspace: Path) -> ToolMessage:
-    """Dispatch the fixed read tool; the Day 1 baseline stops on expected tool failure."""
-    # tool_name 是要调用哪个工具；只接受固定定义表中的名称。
-    if call["name"] not in TOOL_DEFINITIONS:
-        raise ToolError("unknown tool")
-    try:
-        # LangChain 的 ToolCall["args"] 已是字典；invalid_tool_calls 由 response_calls 拒绝。
-        # 成功后得到 ReadArgs 实例，使用 args.path 读取路径字段。
-        args = ReadArgs.model_validate(call["args"])
-    except ValidationError:
-        raise ToolError("read expects an object with a string path only") from None
-    # 先执行 read_file 得到正文，再包装为工具结果对象；此处尚未发回模型。
-    return ToolMessage(
-        # 沿用调用中的工具名称，例如 read。
-        name=call["name"],
-        # 沿用这一次调用的编号，不能另造 ID；模型靠它识别结果对应哪个调用。
-        tool_call_id=(call["id"] or ""),
-        # content 保存实际读取正文，不是模型猜测的文件内容。
-        content=read_file(args, workspace),
-    )
-
-
-def tool_outcome(message: ToolMessage) -> str:
-    """Retain the original success/failed/denied event vocabulary locally."""
-    if message.status == "success":
-        return "success"
-    return "denied" if message.artifact == {"outcome": "denied"} else "failed"
 ```
+
+读取实现先用 `resolve(strict=True)` 解析实际路径，再判断工作区范围；`relative.parts` 是路径组件元组，用于检查受限目录和文件名。二进制读取的上限按字节计算，多读一个字节用于判断超限；`with` 自动关闭文件，`decode("utf-8")` 校验编码。预期的读取与解码错误转换为 `ToolError`。
+
+`src/zeta/builtin_tools/__init__.py` 只提供工具共用的错误类型，不导入或自动注册具体工具：
+
+```python
+"""Shared error type for built-in tools."""
+
+
+class ToolError(Exception):
+    """An expected tool failure safe to return to the caller."""
+```
+
+`src/zeta/__init__.py` 保留版本信息。工具表由 `tools.py` 显式定义，无需在包初始化时触发注册：
+
+```python
+"""Zeta package."""
+
+from importlib.metadata import version
+
+# 从已安装的 zeta 包元数据读取版本字符串，用于 CLI --version。
+__version__ = version("zeta")
+```
+
 
 ## 直接提供：src/zeta/cli.py
 
