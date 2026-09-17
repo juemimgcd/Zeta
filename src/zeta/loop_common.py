@@ -1,13 +1,9 @@
-# ruff: noqa: F401  # Prepared imports for exercise bodies.
-# pyright: reportUnusedImport=false
 from collections.abc import Sequence
 
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
-    HumanMessage,
-    SystemMessage,
     ToolCall,
     ToolMessage,
 )
@@ -28,43 +24,34 @@ class RunStopped(RunLimitError):
 
 
 def response_calls(response: AIMessage) -> list[ToolCall]:
-    # ainvoke returns a full message; a stream chunk must never execute tools.
+    """Reject unparsed calls or ambiguous IDs before executing tools."""
     if isinstance(response, AIMessageChunk) or response.invalid_tool_calls:
         raise ModelResponseError("incomplete response or invalid tool arguments")
-    if not isinstance(response.content, str):
-        raise ModelResponseError("this lesson expects a text-only response")
-    calls = list(response.tool_calls)
+    calls = response.tool_calls
     ids = [call["id"] for call in calls]
     if any(not value or not value.strip() for value in ids) or len(ids) != len(
-            set(ids)
+        set(ids)
     ):
         raise ModelResponseError("ambiguous tool call IDs")
-    if any(not call["name"].strip() for call in calls):
-        raise ModelResponseError("missing tool name")
-    expected_reason = "tool_calls" if calls else "stop"
-    if response.response_metadata.get("finish_reason") != expected_reason:
-        raise ModelResponseError("incomplete model response")
-    if not calls and not response.text.strip():
-        raise ModelResponseError("missing final text")
     return calls
 
 
 def validate_history(messages: Sequence[BaseMessage]) -> None:
+    """Check only tool-result pairing and batch order."""
     pending: dict[str, str] = {}
     for message in messages:
-        if isinstance(message, AIMessage):
-            if pending:
-                raise ValueError("assistant response before complete tool results")
-            for call in response_calls(message):
-                pending[call["id"] or ""] = call["name"]
-        elif isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage):
             if pending.get(message.tool_call_id) != message.name:
                 raise ValueError("unmatched tool result")
             del pending[message.tool_call_id]
-        elif isinstance(message, (HumanMessage, SystemMessage)):
-            if pending:
-                raise ValueError("message inserted inside a tool batch")
-        else:
-            raise TypeError("unsupported message type")
+            continue
+        if pending:
+            raise ValueError("message inserted before complete tool results")
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                call_id = call["id"]
+                if not call_id or not call_id.strip() or call_id in pending:
+                    raise ValueError("ambiguous tool call IDs in history")
+                pending[call_id] = call["name"]
     if pending:
         raise ValueError("incomplete tool batch")

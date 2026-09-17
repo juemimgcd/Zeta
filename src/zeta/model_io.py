@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from zeta.loop_common import ModelResponseError, response_calls
-from zeta.tools import TOOL_DEFINITIONS, ToolSchema
+from zeta.tools import ToolSchema, tool_schemas
 
 
 @asynccontextmanager
@@ -28,32 +28,22 @@ async def create_model() -> AsyncGenerator[ChatOpenAI]:
             )
 
 
-async def request_with_tools(
-        model: ChatOpenAI,
-        history: Sequence[BaseMessage],
-        *,
-        tools: Sequence[ToolSchema] = (),
-        max_tokens: int = 2048,
-) -> AIMessage:
-    requester = model.bind_tools(list(tools)) if tools else model  # pyright: ignore[reportUnknownMemberType]  # Upstream callback annotation contains Unknown.
-    response = await requester.ainvoke(list(history), max_tokens=max_tokens)
-    return response
-
-
 async def request_once(
-        model: ChatOpenAI,
-        history: Sequence[BaseMessage],
-        *,
-        max_tokens: int = 2048,
+    model: ChatOpenAI,
+    history: Sequence[BaseMessage],
+    *,
+    tools: Sequence[ToolSchema] | None = None,
+    max_tokens: int = 2048,
 ) -> AIMessage:
-    return await request_with_tools(
-        model, history, tools=list(TOOL_DEFINITIONS.values()), max_tokens=max_tokens
-    )
+    """Request once; None uses registered tools, an empty sequence disables them."""
+    schemas = tool_schemas() if tools is None else list(tools)
+    requester = model.bind_tools(schemas) if schemas else model  # pyright: ignore[reportUnknownMemberType]  # Upstream callback annotation contains Unknown.
+    return await requester.ainvoke(list(history), max_tokens=max_tokens)
 
 
 async def summarize_once(prompt: str) -> str:
     async with create_model() as model:
-        response = await request_with_tools(model, [HumanMessage(content=prompt)])
+        response = await request_once(model, [HumanMessage(content=prompt)], tools=())
     if response_calls(response):
         raise ModelResponseError("summary unexpectedly requested tools")
     return response.text

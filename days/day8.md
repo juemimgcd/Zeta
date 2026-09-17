@@ -42,7 +42,7 @@ SharedBudget 的计数器和 lock 使用 init=False，不作为构造参数。�
 | `SharedBudget.reserve(estimate, final=False)` | 加锁检查额度，增加 requests/in_flight；非 final 为汇总保留一次请求和 final_tokens，返回 None |
 | `SharedBudget.settle(reserved, used)` | 释放预订量，按 usage 或预估更新账本，返回 None |
 | `SharedBudget.request(model, messages, tools=..., max_tokens=..., final=...)` | 估算 → 预订 → 请求 → finally 结算，返回 AIMessage，失败也结算预订量 |
-| `SharedBudget.request_read(model, messages, max_tokens=...)` | 给 request 带上 read 定义，返回 AIMessage，签名适配 ModelIO.request |
+| `SharedBudget.request_read(model, messages, max_tokens=...)` | 把 tool_schemas() 交给预算入口，返回 AIMessage，签名适配 ModelIO.request；目前内置 read，Worker Hook 另行限制只读权限 |
 | `SharedBudget.summarize(prompt)` | 创建模型，通过共享预算发送无工具摘要请求，检查响应后返回正文 |
 | `resolve_files(workspace, names)` | 解析实际路径并检查目录边界和敏感路径，返回规范相对文件名 → Path 字典 |
 | `plan_tasks(goal, authorized, budget)` | 请求 JSON 计划，用 Plan 校验并核对文件权限，返回 Plan，不执行 Worker |
@@ -54,6 +54,8 @@ SharedBudget 的计数器和 lock 使用 init=False，不作为构造参数。�
 | `synthesize(goal, results, budget)` | 将报告、证据和失败信息交给 Manager，用 final=True 请求汇总，返回文字 |
 | `run_manager(goal, workspace, allowed_files, concurrency=2)` | 校验文件，创建团队存储和预算，规划 → 执行 → 汇总并记账，返回 TeamResult；错误/取消记终态后传播 |
 | 内部函数 `save(status, answer="")` | 供 run_manager 使用，把计划、finished、状态、答案和预算写入 Manager 数据库，返回 None |
+
+`SharedBudget.request` 的默认 `tools=()` 表示无工具，它总把这个参数显式传给 `request_once`；底层 `request_once` 的默认 `tools=None` 则表示使用注册表，二者不要混淆。Manager 规划、汇总和共享摘要走无工具的预算入口；Worker 通过 `request_read` 传入工具列表。这里的封装负责预订与结算共享预算。
 
 `finished` 是 Worker ID → WorkerResult 的字典；`semaphore` 限制同时进入 Worker 主体的数量；`tasks` 保存 asyncio.Task 对象。restrict_tool 保留外层 workspace/allowed 的引用，这叫闭包，因此 invoke 只需传 context。
 
@@ -77,9 +79,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from zeta.loop_common import RunLimitError, response_calls
-from zeta.model_io import create_model, request_with_tools
+from zeta.model_io import create_model, request_once
 from zeta.session import encode
-from zeta.tools import TOOL_DEFINITIONS, ToolSchema
+from zeta.tools import ToolSchema, tool_schemas
 
 
 @dataclass
@@ -129,7 +131,7 @@ class SharedBudget:
         await self.reserve(estimate, final=final)
         used: int | None = None
         try:
-            response = await request_with_tools(
+            response = await request_once(
                 model, messages, tools=tools, max_tokens=max_tokens
             )
             used = (
@@ -151,7 +153,7 @@ class SharedBudget:
         return await self.request(
             model,
             messages,
-            tools=list(TOOL_DEFINITIONS.values()),
+            tools=tool_schemas(),
             max_tokens=max_tokens,
         )
 
@@ -188,7 +190,7 @@ from zeta.model_io import create_model
 from zeta.session import create_session, decode, load_session
 from zeta.storage import JsonStore
 from zeta.team_budget import SharedBudget
-from zeta.tools import ReadArgs
+from zeta.builtin_tools.read import ReadArgs
 
 logger = logging.getLogger(__name__)
 
@@ -317,9 +319,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from zeta.loop_common import RunLimitError, response_calls
-from zeta.model_io import create_model, request_with_tools
+from zeta.model_io import create_model, request_once
 from zeta.session import encode
-from zeta.tools import TOOL_DEFINITIONS, ToolSchema
+from zeta.tools import ToolSchema, tool_schemas
 
 
 @dataclass
@@ -382,7 +384,7 @@ class SharedBudget:
         await self.reserve(estimate, final=final)
         used: int | None = None
         try:
-            response = await request_with_tools(
+            response = await request_once(
                 model, messages, tools=tools, max_tokens=max_tokens
             )
             used = (
@@ -404,7 +406,7 @@ class SharedBudget:
         return await self.request(
             model,
             messages,
-            tools=list(TOOL_DEFINITIONS.values()),
+            tools=tool_schemas(),
             max_tokens=max_tokens,
         )
 
@@ -440,7 +442,7 @@ from zeta.model_io import create_model
 from zeta.session import create_session, decode, load_session
 from zeta.storage import JsonStore
 from zeta.team_budget import SharedBudget
-from zeta.tools import ReadArgs
+from zeta.builtin_tools.read import ReadArgs
 
 logger = logging.getLogger(__name__)
 
@@ -536,7 +538,7 @@ def worker_hooks(workspace: Path, allowed: set[Path]) -> Hooks:
         if context.name != "read":
             return Decision(True, "worker only has read access")
         try:
-            path = (workspace / context.path).resolve(strict=True)
+            path = (workspace / context.args["path"]).resolve(strict=True)
         except OSError, RuntimeError:
             return Decision(True, "file cannot be resolved")
         if path not in allowed:

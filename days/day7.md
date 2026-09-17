@@ -33,11 +33,13 @@
 | 函数或方法 | 输入、功能和返回值 |
 | --- | --- |
 | `read_summary(services, session_id)` | 读取摘要并检查关联记忆仍存在、有效且可访问；返回 Summary，无摘要返回 None，失效则报错 |
-| `ContextRuntime.__init__(session_id, services, reviewed_resume=...)` | 把存储、Hook、模型函数和输出预算接入父类，初始化查询和压缩标志 |
+| `ContextRuntime.__init__(session_id, services)` | 把存储、Hook、模型函数和输出预算接入父类，初始化查询和压缩标志 |
 | `ContextRuntime.start(prompt)` | 先执行父类启动/恢复，再确定 query：优先 recall_query，其次 prompt，否则空串；返回 None |
 | `ContextRuntime.prepare()` | 读会话、recall 并记录记忆来源、读摘要、build_context；必要时 compact、重建并验证后保存摘要；最后 before_model 并复验历史/预算，返回消息列表 |
 | `ContextRuntime.retry(error)` | 识别特定 400 上下文超限错误，首次命中设置压缩及重试标志并返回 True，否则 False；本方法不发送请求 |
-| `run_session_task(session_id, prompt, services, reviewed_resume=...)` | 创建 ContextRuntime 并调用同一个 run_loop，返回最终回答；prompt=None 表示尝试恢复 |
+| `run_session_task(session_id, prompt, services)` | 创建 ContextRuntime 并调用同一个 run_loop，返回最终回答；prompt=None 表示尝试恢复 |
+
+`Services.request` 默认保存 `request_once`，由 Loop 发起带已注册工具的请求；`Services.summarizer` 默认保存 `summarize_once`，内部显式使用空工具序列。Day 8 可以替换这两个函数以加入共享预算，`ModelIO` 和本日组装接口不需要改变。
 
 prepare 中的 `view` 是当前视图，`candidate` 是候选摘要，`candidate_view` 是使用新摘要重建的视图，`request_view` 是 Hook 处理后的最终消息列表。候选验证通过才保存。
 
@@ -114,15 +116,12 @@ def read_summary(services: Services, session_id: str) -> Summary | None:
 
 
 class ContextRuntime(SessionRuntime):
-    def __init__(
-        self, session_id: str, services: Services, *, reviewed_resume: bool = False
-    ) -> None:
+    def __init__(self, session_id: str, services: Services) -> None:
         super().__init__(
             services.database,
             session_id,
             services.workspace,
             allowed_scopes=services.memories.allowed_scopes,
-            reviewed_resume=reviewed_resume,
             hooks=services.hooks,
             listeners=services.listeners,
             io=ModelIO(request=services.request, summarize=services.summarizer),
@@ -154,10 +153,8 @@ async def run_session_task(
     session_id: str,
     prompt: str | None,
     services: Services,
-    *,
-    reviewed_resume: bool = False,
 ) -> str:
-    runtime = ContextRuntime(session_id, services, reviewed_resume=reviewed_resume)
+    runtime = ContextRuntime(session_id, services)
     return await run_loop(prompt, runtime)
 ```
 
@@ -237,15 +234,12 @@ def read_summary(services: Services, session_id: str) -> Summary | None:
 
 
 class ContextRuntime(SessionRuntime):
-    def __init__(
-        self, session_id: str, services: Services, *, reviewed_resume: bool = False
-    ) -> None:
+    def __init__(self, session_id: str, services: Services) -> None:
         super().__init__(
             services.database,
             session_id,
             services.workspace,
             allowed_scopes=services.memories.allowed_scopes,
-            reviewed_resume=reviewed_resume,
             hooks=services.hooks,
             listeners=services.listeners,
             io=ModelIO(request=services.request, summarize=services.summarizer),
@@ -339,10 +333,8 @@ async def run_session_task(
     session_id: str,
     prompt: str | None,
     services: Services,
-    *,
-    reviewed_resume: bool = False,
 ) -> str:
-    runtime = ContextRuntime(session_id, services, reviewed_resume=reviewed_resume)
+    runtime = ContextRuntime(session_id, services)
     return await run_loop(prompt, runtime)
 ```
 

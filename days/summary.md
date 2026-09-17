@@ -1,6 +1,6 @@
 # Zeta 累积式学习路线：写一次，持续复用
 
-更新：2026-09-10。基于 GitHub 9359d5f 原版，仅迁移 LangChain 接入。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
+更新：2026-09-16。基于 GitHub 9359d5f 原版，使用 LangChain 接入，并同步当前工具注册与单次请求接口。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
 
 ## 使用规则
 
@@ -40,14 +40,16 @@ Day 1–8 的练习骨架前均有对象/函数说明：类的职责、字段含
 固定 app.run_agent 或 integration.run_session_task
   → Day 1 run_loop
       → runtime.prepare：默认历史 / Hook / Context + Memory + Compaction
-      → 同一个 ModelIO 请求入口
+      → ModelIO.request：默认 request_once → ainvoke，返回完整 AIMessage
       → runtime.on_response：内存 / Session 提交 + Hook
-      → runtime.execute：基础 read / Day 2 调度
+      → runtime.execute：基础执行 / Day 2 调度，复用 resolve_tool_call、handler、make_tool_message
       → runtime.on_result + after_turn：配对、保存、事件、停止决策
       → 继续或准确终态
 ```
 
 Runtime、HookRuntime、SessionRuntime、ContextRuntime 各自负责新增的一层行为；新方法通过已有方法完成原来的职责，不能把前一层源码复制进新文件。共享循环负责请求/工具预算和取消，策略层决定输入、提交和允许的重试。
+
+工具采用普通函数，在 `tools.py` 的 `TOOLS` 中显式维护“工具名 →（参数模型，执行函数）”；函数文档字符串提供描述，具体 read 在 `builtin_tools/read.py`。模型请求统一使用 `request_once`，默认取全部已注册工具，摘要等无工具用途显式传空序列。完整参数约定见 [基础代码](support.md#模型请求中的工具参数)。
 
 ## Manager / Worker
 
