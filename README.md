@@ -1,7 +1,7 @@
 # Zeta
 
-Zeta 是一个使用 Python 手写 Agent 核心功能的本地 Coding Agent，参考 Pi 的行为和源码。
-这是独立的学习与实现项目，不是 Pi 的官方 Python 移植版，也不逐文件翻译 TypeScript。
+Zeta 是一个使用 Python 构建的本地 Coding Agent，围绕模型请求、工具调用与会话状态，逐步实现可理解、可控制的 Agent 核心。
+项目聚焦本地 CLI、工具执行与运行时状态管理，持续完善从用户输入到模型响应的执行流程。
 
 ## 当前实现方向
 
@@ -18,33 +18,6 @@ Zeta 是一个使用 Python 手写 Agent 核心功能的本地 Coding Agent，�
 用户输入 → 请求 DeepSeek → 收到 read 工具调用
         → 校验并读取工作区文件 → 回传工具结果 → 模型最终回答
 ```
-
-## 本地 Pi 源码参考
-
-Pi 已克隆到本机，无需为查阅 Pi 实现反复联网搜索或重新克隆：
-
-```text
-/Users/jquery/python_files/pi
-```
-
-从 Zeta 根目录也可通过 `../pi` 访问。常用入口（相对于 Pi 根目录）：
-
-| 要研究的能力 | 本地源码入口 |
-| --- | --- |
-| Agent loop 与工具调用流程 | `packages/agent/src/agent-loop.ts` |
-| Agent 消息、状态与事件类型 | `packages/agent/src/types.ts` |
-| 模型协议与流式适配 | `packages/ai/src/` |
-| 文件和 Shell 工具 | `packages/coding-agent/src/core/tools/` |
-| Session 管理 | `packages/coding-agent/src/core/session-manager.ts` |
-| 项目指令与资源加载 | `packages/coding-agent/src/core/resource-loader.ts` |
-| 上下文压缩 | `packages/coding-agent/src/core/compaction/` |
-
-给 Codex 的工作约定：
-
-1. 分析或实现 Pi 相关功能时，优先读取上述本地源码，沿实际调用链理解行为、错误处理和安全边界。
-2. 本地源码足以回答的问题不联网搜索；只有用户要求最新信息，或本地材料不足以确认外部 API 行为时，再查官方资料。
-3. 路径变化时先在本地用 `rg --files ../pi` 定位，不假定需要下载源码。
-4. Pi 仓库作为只读参考；只在 Zeta 中实现当前任务需要的 Python 功能。
 
 ## 当前可运行功能
 

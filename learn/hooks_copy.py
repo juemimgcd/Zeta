@@ -61,28 +61,28 @@ class Hooks:
             raise ValueError("unknown hook")
         current = deepcopy(context)
         for callback in self.callbacks[name]:
-            result = await callback(deepcopy(current))
-            if result is None:
+            result = await callback(current)
+            if not result:
                 continue
             if name == "before_model":
                 if not isinstance(current,list) or not isinstance(result,list):
-                    raise TypeError("before_model must return a list")
+                    raise ValueError("before_model and after_model are not iterable")
                 if not current or len(current) > len(result):
-                    raise TypeError("before_model must return a list")
-                if result[:-len(current)] != current:
-                    raise TypeError("before_model must return a list")
+                    raise ValueError("before_model and after_model are not iterable")
+                if result[:-len(current)]!=current:
+                    raise ValueError("before_model and after_model are not iterable")
                 for message in result[:-len(current)]:
                     if (
                         not isinstance(message,HumanMessage)
                         or not isinstance(message.content,str)
-                        or not message.content.strip()
+                        or message.content.strip()
                     ):
-                        raise TypeError("before_model must return a human message")
+                        raise ValueError("HumanMessage and content are not iterable")
                 current = deepcopy(result)
-                validate_history(result)
+
             elif name == "after_tool":
                 if not isinstance(current,ToolMessage) or not isinstance(result,ToolMessage):
-                    raise TypeError("after_tool must return a ToolMessage")
+                    raise ValueError("ToolMessage and result are not iterable")
                 if (
                     result.name,
                     result.tool_call_id,
@@ -94,25 +94,32 @@ class Hooks:
                     current.status,
                     current.artifact
                 ):
-                    raise TypeError("after_tool must return a ToolMessage")
+                    raise ValueError("ToolMessage and result are not iterable")
                 current = deepcopy(result)
-            elif name in ("before_mode","after_turn"):
+            elif name in ("before_tool","after_turn"):
                 if not isinstance(result,Decision):
-                    raise TypeError("after_mode must return a Decision")
+                    raise ValueError("Decision are not iterable")
                 if result.stop:
                     if not result.reason.strip():
-                        raise TypeError("after_mode must return a Decision")
+                        raise ValueError("Decision are not iterable")
                     return result
             else:
-                raise TypeError("after_mode must return a Decision")
-
-        if name in ("after_turn","before_tool"):
+                raise ValueError("unknown hook")
+        if name in ("before_tool","after_turn"):
             return Decision()
         if name == "after_model":
             return None
-        if isinstance(current,(ToolMessage,list)):
+        if isinstance(current,(list,ToolMessage)):
             return current
-        raise TypeError("after_model must return a ToolMessage")
+        raise ValueError("unknown hook")
+
+
+
+
+
+
+
+
 
 
 
