@@ -24,8 +24,8 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
         async with asyncio.timeout(runtime.options.timeout):
             await runtime.start(prompt)
             async with runtime.io.factory() as model:
-                while runtime.requests <= runtime.options.max_requests:
-                    await runtime.begin_turn()
+                await runtime.begin_turn()
+                while runtime.requests < runtime.options.max_requests:
                     messages = await runtime.prepare()
                     validate_history(messages)
                     try:
@@ -37,9 +37,10 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                     except ModelHTTPError as e:
                         if (
                             runtime.requests < runtime.options.max_requests
-                            or await runtime.retry(e)
+                            and await runtime.retry(e)
                         ):
                             continue
+                        raise e
                     calls = response_calls(response)
                     await runtime.on_response(response)
                     result:list[ToolMessage] = []
@@ -48,32 +49,43 @@ async def run_loop(prompt: str | None, runtime: Runtime) -> str:
                             runtime.requests >= runtime.options.max_requests
                             or runtime.tool_calls + len(calls) > runtime.options.max_tool_calls
                         ):
-                            raise ValueError("")
+                            raise RunLimitError("")
+                        runtime.tool_calls += len(calls)
                         for call in calls:
                             execution = await runtime.execute(call)
                             await runtime.on_result(execution)
                             result.append(execution.result)
+                    await runtime.after_turn(result)
                     if not calls:
                         status = "completed"
                         return response.text or ""
                 raise RunLimitError("")
     except BaseException as e:
         primary = e
-        status = ("cancelled"
-                  if isinstance(e,asyncio.CancelledError)
-                  else ("stopped" if isinstance(e,RunLimitError) else "failed")
-                  )
+        status = (
+            "cancelled" if isinstance(e,asyncio.CancelledError)
+            else ("stopped" if isinstance(e,RunLimitError) else "failed")
+        )
         reason = (
             str(e) if isinstance(e,RunLimitError) else type(e).__name__
         )
-        raise
+        raise e
     finally:
         try:
-            await runtime.finish(status, reason)
+            await runtime.finish(status,reason)
         except BaseException as cleanup_error:
             if primary is None:
                 raise
             logger.warning("cleanup failed: %s", type(cleanup_error).__name__)
+
+
+
+
+
+
+
+
+
 
 
 

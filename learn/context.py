@@ -104,14 +104,15 @@ def build_context(
         budget: Budget,
 ) -> ContextView:
     if instructions != INSTRUCTIONS:
-        raise ValueError("instructions not supported")
+        raise ValueError("uncovered instructions do not cover all entries")
     available = budget.input_limit
-    entries = uncovered_entries(history,summary)
+    entries = uncovered_entries(history, summary)
     turns = split_turns(entries)
     first = max(0,len(turns)-2)
     selected = [entry for turn in turns[first:] for entry in turn]
     chosen:list[Resource] = []
     decisions:list[str] = []
+
     if summary is not None:
         chosen.append(Resource(f"summary:{summary.version}",summary.text))
 
@@ -127,13 +128,14 @@ def build_context(
         return [SystemMessage(content=instructions), *messages]
 
     if estimate_tokens(render(chosen,selected)) > available:
-        raise ValueError("estimated tokens do not cover all entries")
-    for item in [*(Resource(f"{m.id}",m.text) for m in memories),*resources]:
+        raise ValueError("uncovered entries do not cover all entries")
+
+    for item in [*(Resource(f"summary:{m.id}",m.text)for m in memories),*resources]:
         if estimate_tokens(render([*chosen,item],selected)) <= available:
             chosen.append(item)
-            decisions.append(f"{item.source_id}:{item.text}")
+            decisions.append(item)
         else:
-            decisions.append(f"{item.source_id}:{item.text}")
+            decisions.append(item)
 
     while first > 0:
         candidate = [*turns[first-1],*selected]
@@ -141,8 +143,26 @@ def build_context(
             break
         selected = candidate
         first -= 1
+    messages = render(chosen, selected)
+    if first:
+        decisions.append(
+            "old complete tasks omitted; compaction required before sending"
+        )
+    return ContextView(
+        messages=messages,
+        source_ids=[
+            *(item.source_id for item in chosen),
+            *(entry.id for entry in selected),
+        ],
+        estimated_tokens=estimate_tokens(messages),
+        needs_compaction=first > 0,
+        decisions=decisions,
+    )
 
-    messages = render(chosen,selected)
+
+
+
+
 
 
 

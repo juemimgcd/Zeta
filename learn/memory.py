@@ -41,26 +41,28 @@ def remember(
         raise PermissionError("You are not allowed to use this function")
     if not scope.strip() or scope not in store.allowed_scopes:
         raise ValueError("scope is invalid")
-    sessions = [
-        SessionData.model_validate_json(body)
-        for body in store.database.all("session")
-    ]
-    if not any(
-            session.scope == scope
-            or any(entry.id == source_entry_id for entry in session.entries)
-            for session in sessions
-    ):
-        raise ValueError("session id is invalid")
-    for body in store.database.all("memory"):
-        memory = Memory.model_validate_json(body)
-        if (
-                memory.active
-                and memory.scope == scope
-                and memory.text == text.strip()
+    with store.database.transaction():
+        sessions = [
+            SessionData.model_validate_json(body)
+            for body in store.database.all("session")
+        ]
+        if not any(
+                session.scope == scope
+                or any(entry.id == source_entry_id for entry in session.entries)
+                for session in sessions
         ):
-            return memory
-    memory = Memory(text=text.strip(), scope=scope, source_entry_id=source_entry_id, )
-    return memory
+            raise ValueError("session id is invalid")
+        for body in store.database.all("memory"):
+            memory = Memory.model_validate_json(body)
+            if (
+                    memory.active
+                    and memory.scope == scope
+                    and memory.text == text.strip()
+            ):
+                return memory
+        memory = Memory(text=text.strip(), scope=scope, source_entry_id=source_entry_id, )
+        store.database.put("memory", memory.id, memory.model_dump_json())
+        return memory
 
 
 def recall(
