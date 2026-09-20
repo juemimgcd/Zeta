@@ -1,10 +1,8 @@
 import asyncio
 import logging
 
-from anyio.to_interpreter import run_sync
 from langchain_core.messages import ToolMessage
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ToolReturnPart
 
 from zeta.loop_common import RunLimitError, response_calls, validate_history
 from zeta.runtime_base import RunStatus, Runtime
