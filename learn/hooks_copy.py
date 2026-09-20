@@ -12,6 +12,7 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
+from pydantic_ai.mcp import ToolResult
 
 from zeta.loop_common import validate_history
 
@@ -61,28 +62,27 @@ class Hooks:
             raise ValueError("unknown hook")
         current = deepcopy(context)
         for callback in self.callbacks[name]:
-            result = await callback(current)
-            if not result:
+            result = await callback(deepcopy(current))
+            if result is None:
                 continue
             if name == "before_model":
-                if not isinstance(current,list) or not isinstance(result,list):
-                    raise ValueError("before_model and after_model are not iterable")
-                if not current or len(current) > len(result):
-                    raise ValueError("before_model and after_model are not iterable")
-                if result[:-len(current)]!=current:
-                    raise ValueError("before_model and after_model are not iterable")
-                for message in result[:-len(current)]:
+                if not isinstance(current, list) or not isinstance(result, list):
+                    raise TypeError("before_model must return a message list")
+                if not current or len(result) < len(current):
+                    raise ValueError("hook cannot remove the prepared context")
+                if result[-len(current):] != current:
+                    raise ValueError("hook cannot rewrite prepared messages")
+                for message in result[-len(current):]:
                     if (
                         not isinstance(message,HumanMessage)
                         or not isinstance(message.content,str)
-                        or message.content.strip()
+                        or not message.content.strip()
                     ):
-                        raise ValueError("HumanMessage and content are not iterable")
-                current = deepcopy(result)
-
+                        raise ValueError("prepared message must contain a human message")
+                current = deepcopy(current)
             elif name == "after_tool":
-                if not isinstance(current,ToolMessage) or not isinstance(result,ToolMessage):
-                    raise ValueError("ToolMessage and result are not iterable")
+                if not isinstance(current,ToolMessage) or not isinstance(result, ToolMessage):
+                    raise TypeError("after_tool must return a message list")
                 if (
                     result.name,
                     result.tool_call_id,
@@ -94,14 +94,14 @@ class Hooks:
                     current.status,
                     current.artifact
                 ):
-                    raise ValueError("ToolMessage and result are not iterable")
-                current = deepcopy(result)
+                    raise ValueError("prepared message must contain a tool message")
+                current = deepcopy(current)
             elif name in ("before_tool","after_turn"):
                 if not isinstance(result,Decision):
-                    raise ValueError("Decision are not iterable")
+                    raise TypeError("before_tool must return a decision")
                 if result.stop:
-                    if not result.reason.strip():
-                        raise ValueError("Decision are not iterable")
+                    if not result.reason:
+                        raise ValueError("before_tool must return a decision")
                     return result
             else:
                 raise ValueError("unknown hook")
@@ -112,6 +112,10 @@ class Hooks:
         if isinstance(current,(list,ToolMessage)):
             return current
         raise ValueError("unknown hook")
+
+
+
+
 
 
 

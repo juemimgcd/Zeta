@@ -1,4 +1,3 @@
-# ruff: noqa: F401  # Prepared imports for exercise bodies.
 # pyright: reportUnusedImport=false
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -20,7 +19,7 @@ class Memory(BaseModel):
     source_entry_id: str
     # 记忆的创建时间，使用 UTC 时区的 ISO 8601 字符串。
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
-    # 记忆是否有效；False 表示逻辑失效，forget 的失效操作尚待实现。
+    # 记忆是否有效；False 表示逻辑失效，forget 不删除原始记录。
     active: bool = True
 
 
@@ -35,60 +34,70 @@ class MemoryStore:
 
 
 def remember(
-        store: MemoryStore, text: str, scope: str, source_entry_id: str, *, confirmed: bool
+    store: MemoryStore, text: str, scope: str, source_entry_id: str, *, confirmed: bool
 ) -> Memory:
     if not confirmed:
+        raise PermissionError("explicit confirmation required")
+
+    normalized_text = text.strip()
+    normalized_scope = scope.strip()
+    if not normalized_text:
+        raise ValueError("memory text is required")
+    if not normalized_scope or normalized_scope not in store.allowed_scopes:
         raise ValueError("scope is invalid")
-    if not scope.strip() or scope not in store.allowed_scopes:
-        raise ValueError("scope is invalid")
-    sessions = [
-        SessionData.model_validate_json(body)
-        for body in store.database.all("session")
-    ]
-    if not any(
-        session.scope == scope
-        or any(entry.id == source_entry_id for entry in session.entries)
-        for session in sessions
-    ):
-        raise ValueError("scope is invalid")
-    for body in store.database.all("memory"):
-        memory = Memory.model_validate_json(body)
-        if (
-            memory.active
-            and memory.scope == scope
-            and memory.text == text.strip()
-        ):
-            return memory
-    memory = Memory(text=text, scope=scope, source_entry_id=source_entry_id)
-    return memory
 
+    with store.database.transaction():
+        sessions = [
+            SessionData.model_validate_json(body)
+            for body in store.database.all("session")
+        ]
+        source_exists = any(
+            session.scope == normalized_scope
+            and any(entry.id == source_entry_id for entry in session.entries)
+            for session in sessions
+        )
+        if not source_exists:
+            raise ValueError("source entry is missing or outside the scope")
 
+        for body in store.database.all("memory"):
+            memory = Memory.model_validate_json(body)
+            if (
+                memory.active
+                and memory.scope == normalized_scope
+                and memory.text == normalized_text
+            ):
+                return memory
 
-
-
+        memory = Memory(
+            text=normalized_text,
+            scope=normalized_scope,
+            source_entry_id=source_entry_id,
+        )
+        store.database.put("memory", memory.id, memory.model_dump_json())
+        return memory
 
 
 def recall(
-        store: MemoryStore, query: str, allowed_scopes: frozenset[str], limit: int = 5
+    store: MemoryStore, query: str, allowed_scopes: frozenset[str], limit: int = 5
 ) -> list[Memory]:
-    if not isinstance(limit, int) or limit <= 0:
+    if type(limit) is not int or limit <= 0:
         raise ValueError("limit must be an integer greater than 0")
     if not allowed_scopes <= store.allowed_scopes:
         raise ValueError("scope is invalid")
     keyword = query.casefold().split()
     if not keyword:
         return []
-    ranked:list[tuple[int,Memory]] = []
+    ranked: list[tuple[int, Memory]] = []
     for body in store.database.all("memory"):
         memory = Memory.model_validate_json(body)
         if not memory.active or memory.scope not in allowed_scopes:
             continue
-        score = sum(word in memory.text for word in keyword)
+        score = sum(word in memory.text.casefold() for word in keyword)
         if score:
             ranked.append((score, memory))
-    ranked.sort(key=lambda pair:(-pair[0], pair[1].id))
-    seen:set[tuple[str,str]] = set()
-    result:list[Memory] = []
+    ranked.sort(key=lambda pair: (-pair[0], pair[1].id))
+    seen: set[tuple[str, str]] = set()
+    result: list[Memory] = []
     for _, memory in ranked:
         key = (memory.scope, memory.text)
         if key not in seen:
@@ -97,8 +106,6 @@ def recall(
             if len(result) >= limit:
                 break
     return result
-
-
 
 
 def forget(store: MemoryStore, memory_id: str, *, confirmed: bool) -> None:
@@ -113,9 +120,3 @@ def forget(store: MemoryStore, memory_id: str, *, confirmed: bool) -> None:
             raise PermissionError("memory belongs to another scope")
         memory.active = False
         store.database.put("memory", memory.id, memory.model_dump_json())
-
-
-
-
-
-
