@@ -156,7 +156,7 @@ class ContextRuntime(SessionRuntime):
         )
         if not overflow or self.overflow_retried:
             return False
-        self.overflow_retried = self.force_compaction
+        self.overflow_retried = self.force_compaction = True
         return True
 
 
