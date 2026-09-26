@@ -1,25 +1,25 @@
 # Zeta 累积式学习路线：写一次，持续复用
 
-更新：2026-09-16。基于 GitHub 9359d5f 原版，使用 LangChain 接入，并同步当前工具注册与单次请求接口。八个单元共享同一套代码。每个文件只有一个所属单元；后一天只增加新文件，不替换前一天已经写好的实现。
+更新：2026-09-26。基于 GitHub 9359d5f 原版，使用 LangChain 接入，并同步当前工具注册与单次请求接口。九个单元复用同一个 Agent 循环。每个文件有明确的所属单元，后续单元复用已有实现；Day 8 为 dispatch.py 增加可选执行入口，默认行为保持不变。
 
 ## 使用规则
 
 第一次接触 LangChain 时，先读 [Day 1 前置知识：从 Python 对象到一次完整的工具调用](prerequisites.md)。其中具体解释消息与片段、调用编号、工具结果、异步语法，以及 Day 1 三个核心函数；这是一篇阅读材料，不增加新的实现任务。
 
 1. 先准备 [固定基础代码](support.md)：app.py、Runtime 接入契约、配置、模型请求、CLI、SQLite 直接提供。
-2. 每天复制当天的完整骨架：导包、异常类、数据属性和初始化都已给出，只填标记的核心函数体。
+2. Day 1–7 和 Day 9 使用完整练习骨架；Day 8 按函数练习顺序完成队列接入，并提供完整参考实现。
 3. 写完后展开当天完整答案核对。已有正确实现保留；不要为了跟上下一天而整文件覆盖它。
-4. Day 1 的 run_loop 是唯一循环。Day 2/3 增加各自接入层，Day 7 组装，Day 8 复用；不再出现多个 run_agent 版本。
+4. Day 1 的 run_loop 是唯一循环。Day 2/3 增加各自接入层，Day 7 组装，Day 8/9 复用；不再出现多个 run_agent 版本。
 
-“天”是学习单元，完成并验收后再继续。基础实现选择可以简化，但已写函数的契约不会被后续课程推翻。
+“天”是学习单元，完成并验收后再继续。基础实现选择可以简化；Day 8 的 runner 是可选参数，不改变旧调用方的默认行为。
 
 ## 类、属性与函数的阅读入口
 
-Day 1–8 的练习骨架前均有对象/函数说明：类的职责、字段含义、函数输入和返回值；没有新类的 Day 6 则说明复用类型和摘要回调。骨架与参考答案共用这份说明，原有练习顺序保留。
+各单元均有对象/函数说明：类的职责、字段含义、函数输入和返回值；没有新类的 Day 6 则说明复用类型和摘要回调。骨架与参考答案共用这份说明，原有练习顺序保留。
 
 公共对象先查 [support.md](support.md#先认识基础代码中的类与函数)，Python 语法查 [prerequisites.md](prerequisites.md)。Day 2 的 callback、context、invoke 修改和决策规则有 [具体示例与分支讲解](hooks-explained.md#9-invoke-的实际回调与逐分支解释)。这些解释描述教学答案，不表示 src 中的练习已经完成。
 
-## 八天主线与文件归属
+## 九天主线与文件归属
 
 | 单元 | 今天手写什么 | 今天新增文件 | 复用的已有内容 |
 | --- | --- | --- | --- |
@@ -30,7 +30,8 @@ Day 1–8 的练习骨架前均有对象/函数说明：类的职责、字段含
 | [Day 5](day5.md) | Context 选择、来源和预算 | context.py | 原始历史与 Memory |
 | [Day 6](day6.md) | 压缩边界、候选摘要 | compaction.py | Context 类型、无工具摘要请求 |
 | [Day 7](day7.md) | ContextRuntime 的组装和重试策略 | integration.py | 前六天全部实现；不新增循环 |
-| [Day 8](day8.md) | Manager/Worker 编排与共享预算 | team_budget.py、orchestration.py | 同一个 run_session_task 和 run_loop |
+| [Day 8](day8.md) | Celery + Redis 单机工具队列 | celery_app.py、queue_tools.py、queue_runtime.py | 扩展 dispatch.py 的可选 runner；复用 Loop、Hooks 和 Session |
+| [Day 9](day9.md) | Manager/Worker 编排与共享预算 | team_budget.py、orchestration.py | 同一个 run_session_task 和 run_loop |
 
 文件归属与完整基础代码详见 [support.md](support.md#文件所有权)。runtime_base.py 的默认行为真实可用，后续扩展只添加行为，不让你先补未来模块的空实现。
 
@@ -51,11 +52,13 @@ Runtime、HookRuntime、SessionRuntime、ContextRuntime 各自负责新增的一
 
 工具采用普通函数，在 `tools.py` 的 `TOOLS` 中显式维护“工具名 →（参数模型，执行函数）”；函数文档字符串提供描述，具体 read 在 `builtin_tools/read.py`。模型请求统一使用 `request_once`，默认取全部已注册工具，摘要等无工具用途显式传空序列。完整参数约定见 [基础代码](support.md#模型请求中的工具参数)。
 
-## Manager / Worker
+## 工具队列与 Manager / Worker
 
-Day 8：Manager 生成结构化任务 → 多个隔离 Worker 限并发运行 → 收集证据和失败 → Manager 汇总。每个 Worker 有独立 Session、Memory scope 和只读路径权限，不继承父完整历史，也不能递归委派。
+Day 8：通过 Redis 将 read 交给独立 Celery Worker，主进程仍负责 Hooks、结果配对和 Session 提交。先保留同一批工具串行等待，不包含自动重试、重启接回或运行中任务强制终止。
 
-共享预算覆盖 Manager、Worker、摘要和重试；父取消向下传播。Services 首次定义时就有 request/summarizer 字段，Day 8 只传实现，不修改 Day 7。此模式不声称复刻 Codex 内部实现，也不把多 Agent 称作 Pi 默认内置能力。
+Day 9：Manager 生成结构化任务 → 多个隔离 Worker 限并发运行 → 收集证据和失败 → Manager 汇总。每个 Worker 有独立 Session、Memory scope 和只读路径权限，不继承父完整历史，也不能递归委派。
+
+共享预算覆盖 Manager、Worker、摘要和重试；父取消向下传播。Services 首次定义时就有 request/summarizer 字段，Day 9 只传实现，不修改 Day 7。此模式不声称复刻 Codex 内部实现，也不把多 Agent 称作 Pi 默认内置能力。
 
 ## 学习重点与边界
 

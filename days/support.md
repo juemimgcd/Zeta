@@ -1,4 +1,4 @@
-# 固定基础代码：一次准备，八天复用
+# 固定基础代码：一次准备，九天复用
 
 不熟悉下文的类、函数和属性时，先读 [Day 1 前置知识](prerequisites.md)，再回来准备基础文件。
 
@@ -46,7 +46,8 @@ LLM_API_KEY=你的密钥
 | Day 5 | context.py | 独立上下文选择 |
 | Day 6 | compaction.py | 独立摘要策略 |
 | Day 7 | integration.py | 组装前面能力，调用既有 run_loop |
-| Day 8 | team_budget.py、orchestration.py | Worker 复用 Day 7，不修改父级接口 |
+| Day 8 | celery_app.py、queue_tools.py、queue_runtime.py | 为 Day 2 的 dispatch.py 增加可选 runner，复用 Hooks 和 Session |
+| Day 9 | team_budget.py、orchestration.py | Worker 复用 Day 7，不修改父级接口 |
 
 `ReadArgs` 和普通函数 `read_file` 位于 `builtin_tools/read.py`；`tools.py` 直接导入它们，在 `TOOLS` 中保存工具名与（参数模型，执行函数）的对应关系，并提供参数解析和结果包装。`ToolError` 定义在 `builtin_tools/__init__.py`，避免具体工具反向依赖调度模块。包的 `__init__.py` 只负责版本信息。Day 2 的 `dispatch.py` 复用这些公共函数。
 
@@ -60,7 +61,8 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 - Day 2：传 HookRuntime，仍调用同一个 run_agent。
 - Day 3：新 SessionRuntime 持久化；用同一个 run_loop 接受新输入或恢复。
 - Day 7：ContextRuntime 只组装上下文和重试策略，run_session_task 是调用 run_loop 的薄入口。
-- Day 8：为 Services 传共享 request/summarizer，Worker 仍调用 Day 7 入口。
+- Day 8：QueueRuntime 继承 ContextRuntime，通过可选 runner 将 read 交给 Celery Worker。
+- Day 9：为 Services 传共享 request/summarizer，Worker 仍调用 Day 7 入口。
 
 `RunOptions` 的次数/时限/输出上限，`ModelIO` 的模型请求/摘要函数，`ToolExecution` 的原始与最终结果都预先定义。运行配置不随天数换签名，错误类型在 Day 1 骨架提前提供。
 
@@ -141,11 +143,11 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 
 `ModelIO.request` 只是保存函数；默认指向 `request_once`，不增加一次模型请求。`request_once` 中一次 `ainvoke` 返回完整 `AIMessage`，由 Loop 检查和处理。`summarize_once` 不经过 Loop，所以自己调用 `response_calls` 检查响应，再拒绝意外工具调用并返回文本。
 
-`RequestFn` 只规定 Loop 需要的 model、messages、max_tokens，不要求所有替代函数都暴露 tools 参数。Day 8 的 `SharedBudget.request_read` 仍满足这个接口；它通过预算入口把工具列表交给 `request_once`。
+`RequestFn` 只规定 Loop 需要的 model、messages、max_tokens，不要求所有替代函数都暴露 tools 参数。Day 9 的 `SharedBudget.request_read` 仍满足这个接口；它通过预算入口把工具列表交给 `request_once`。
 
 ## 一次提供的完整文件
 
-先将下面基础文件与 Day 1 骨架组合。app.py 导入你要完成的 loop.py，runtime_base.py 导入 Day 1 已提供定义的 loop_common.py；不存在对尚未新增的 Day 2–8 模块的导入。
+先将下面基础文件与 Day 1 骨架组合。app.py 导入你要完成的 loop.py，runtime_base.py 导入 Day 1 已提供定义的 loop_common.py；不存在对尚未新增的 Day 2–9 模块的导入。
 
 ## 直接提供：src/zeta/runtime_base.py
 
@@ -606,7 +608,7 @@ Day 2 完成后可以这样真实调用：
 uv run python -c 'import asyncio; from pathlib import Path; from dotenv import load_dotenv; from zeta.app import run_agent; from zeta.hook_runtime import HookRuntime; load_dotenv(); p=Path.cwd(); print(asyncio.run(run_agent("用 read 读取 README.md", p, runtime=HookRuntime(p))))'
 ```
 
-Day 7 调用 run_session_task 前，用 create_session 创建 Session，并构造 Services；Day 8 直接调用 run_manager。调用位置可以变化，但入口实现、已经写完的函数不需要重写。
+Day 7 调用 run_session_task 前，用 create_session 创建 Session，并构造 Services；Day 9 直接调用 run_manager。调用位置可以变化，但入口实现、已经写完的函数不需要重写。
 
 模型密钥放在本地环境或 .env；SQLite 存储目录 .zeta/ 需加入 .gitignore。真实调用与创建数据库由你完成练习后执行，文档编辑不自动运行它们。
 
