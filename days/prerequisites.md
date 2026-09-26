@@ -276,7 +276,7 @@ ChatOpenAI 是 LangChain 的模型客户端。创建对象和 bind_tools 都不�
 
 ### 10.3 response 还保存什么
 
-response_metadata 保留结束原因等服务商元数据；usage_metadata 保留 input_tokens、output_tokens、total_tokens 等用量。未提供 usage 时是 None，不能伪造为真实的零用量。Day 8 沿用预留额度结算缺失用量的策略。
+response_metadata 保留结束原因等服务商元数据；usage_metadata 保留 input_tokens、output_tokens、total_tokens 等用量。未提供 usage 时是 None，不能伪造为真实的零用量。Day 9 沿用预留额度结算缺失用量的策略。
 
 ## 11. Runtime、self 和配置对象：读懂“点号接点号”
 
