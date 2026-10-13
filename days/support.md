@@ -46,7 +46,7 @@ LLM_API_KEY=你的密钥
 | Day 5 | context.py | 独立上下文选择 |
 | Day 6 | compaction.py | 独立摘要策略 |
 | Day 7 | integration.py | 组装前面能力，调用既有 run_loop |
-| Day 8 | mcp_git.py | FastMCP 接入只读 Git 工具，复用基础 Runtime |
+| Day 8 | celery_app.py、queue_tools.py、queue_runtime.py | 为 Day 2 的 dispatch.py 增加可选 runner，复用 Hooks 和 Session |
 | Day 9 | team_budget.py、orchestration.py | Worker 复用 Day 7，不修改父级接口 |
 
 `ReadArgs` 和普通函数 `read_file` 位于 `builtin_tools/read.py`；`tools.py` 直接导入它们，在 `TOOLS` 中保存工具名与（参数模型，执行函数）的对应关系，并提供参数解析和结果包装。`ToolError` 定义在 `builtin_tools/__init__.py`，避免具体工具反向依赖调度模块。包的 `__init__.py` 只负责版本信息。Day 2 的 `dispatch.py` 复用这些公共函数。
@@ -61,7 +61,7 @@ Runtime 的接入点从一开始就齐全：start、begin_turn、prepare、on_re
 - Day 2：传 HookRuntime，仍调用同一个 run_agent。
 - Day 3：新 SessionRuntime 持久化；用同一个 run_loop 接受新输入或恢复。
 - Day 7：ContextRuntime 只组装上下文和重试策略，run_session_task 是调用 run_loop 的薄入口。
-- Day 8：用 FastMCP 连接 Git server，通过基础 Runtime 复用 Day 1 循环。
+- Day 8：QueueRuntime 继承 ContextRuntime，通过可选 runner 将 read 交给 Celery Worker。
 - Day 9：为 Services 传共享 request/summarizer，Worker 仍调用 Day 7 入口。
 
 `RunOptions` 的次数/时限/输出上限，`ModelIO` 的模型请求/摘要函数，`ToolExecution` 的原始与最终结果都预先定义。运行配置不随天数换签名，错误类型在 Day 1 骨架提前提供。

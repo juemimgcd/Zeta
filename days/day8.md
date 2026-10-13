@@ -8,7 +8,7 @@
 
 今天做一个单机版本：一个 Redis 实例、一条工具队列、一个 Celery Worker。先让现有 `read` 走通“提交 → 执行 → 返回结果 → 模型继续回答”。Redis 同时承担 Broker 和 Result Backend；SQLite 仍由 Zeta 主进程管理。
 
-本文是学习任务和参考实现，不代表 `src` 已接入 Celery。当前总览中的 Day 8 仍是旧的 FastMCP 主题；本页按 Celery + Redis 编写，Day 9 保留原有多 Agent 内容。
+本文是学习任务和参考实现，不代表 `src` 已接入 Celery。Day 9 保留原有 Manager / Worker 多 Agent 课程。
 
 ## 先区分三个概念
 
