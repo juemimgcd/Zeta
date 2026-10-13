@@ -2,6 +2,8 @@
 
 [总览](summary.md) · [固定基础代码](support.md)
 
+本日补全的是基础组装版，延续 Day 5–6 的完整任务压缩边界。按 token 保留、长任务内部切分和分批摘要见 [Compaction 优化方案](compaction-optimization.md)，不把尚未实现的进阶能力写进本日参考答案。
+
 ## 核心问题
 
 把 Day 3–6 的能力连接起来，而不是再写一遍 Agent。今天只实现 ContextRuntime.prepare/retry：选上下文、调用已有压缩、决定溢出后是否重试。请求、工具、Hook、事件、终态仍由前几天完成的代码负责。
@@ -18,7 +20,7 @@
 - prepare 调用已有 recall/build_context/compact；候选必须变小并降至 65% 目标内，再保存。达到 80% 输入额度时可主动压缩。
 - apply_before_model 复用 Day 2，之后再次检查协议与预算；不能为此另实现一套 Hook。
 - retry 仅识别明确的上下文长度错误、最多允许一次压缩重试。实际请求计数与继续动作仍属于 run_loop。
-- request/summarizer 字段从本文件首次提供时就已存在，Day 8 只传入共享预算包装，不加字段、不改调用点。
+- request/summarizer 字段从本文件首次提供时就已存在，Day 9 只传入共享预算包装，不加字段、不改调用点。
 - run_session_task 只创建 ContextRuntime 并 await run_loop；没有第二个 while 或工具循环。
 
 ## 先认识本日的类与函数
@@ -39,9 +41,60 @@
 | `ContextRuntime.retry(error)` | 识别特定 400 上下文超限错误，首次命中设置压缩及重试标志并返回 True，否则 False；本方法不发送请求 |
 | `run_session_task(session_id, prompt, services)` | 创建 ContextRuntime 并调用同一个 run_loop，返回最终回答；prompt=None 表示尝试恢复 |
 
-`Services.request` 默认保存 `request_once`，由 Loop 发起带已注册工具的请求；`Services.summarizer` 默认保存 `summarize_once`，内部显式使用空工具序列。Day 8 可以替换这两个函数以加入共享预算，`ModelIO` 和本日组装接口不需要改变。
+`Services.request` 默认保存 `request_once`，由 Loop 发起带已注册工具的请求；`Services.summarizer` 默认保存 `summarize_once`，内部显式使用空工具序列。Day 9 可以替换这两个函数以加入共享预算，`ModelIO` 和本日组装接口不需要改变。
 
 prepare 中的 `view` 是当前视图，`candidate` 是候选摘要，`candidate_view` 是使用新摘要重建的视图，`request_view` 是 Hook 处理后的最终消息列表。候选验证通过才保存。
+
+## 一次请求怎样串起来
+
+```text
+run_session_task(session_id, prompt, services)
+  → 创建 ContextRuntime
+  → 进入 Day 1 的 run_loop
+      → start：检查 Session 范围、pending 和启动/恢复条件
+      → prepare：召回 → 构建 Context → 必要时压缩 → before_model
+      → 请求模型
+      → on_response：保存 assistant 响应及 pending 调用
+      → execute / on_result：执行工具，逐条保存结果
+      → after_turn：复用 HookRuntime 的后处理
+      → 有工具调用则继续下一轮；否则返回最终回答
+      → finish：保存终态并完成父类清理
+```
+
+ContextRuntime 不覆盖 `on_response`、`execute`、`on_result` 和 `finish`，这些行为继续来自 SessionRuntime / HookRuntime。不要在 prepare 内手动调用工具或把响应再保存一次。
+
+`prepare` 从数据库读取 Session，是为了使用已经提交的完整历史；返回值只用于本次模型请求，不把被裁剪的视图写回 `session.entries`。原历史、摘要和本轮消息视图是三个不同对象。
+
+## prepare 的实现顺序
+
+1. **读取会话并召回记忆。** 使用可信 `allowed_scopes` 调用 recall。把召回记忆的 ID 合入 `session.memory_ids`，再读取摘要并检查其来源记忆是否仍有效。
+2. **构建初始 Context。** 固定指令、资源、记忆、旧摘要和 Session 历史一起交给 Day 5 的 build_context，不在这里复制选择算法。
+3. **判断是否压缩。** 任一条件成立即可：上一次请求超限后设置了 `force_compaction`；view 标记 `needs_compaction`；存在可压缩旧任务且当前估算达到输入额度的 80%。
+4. **生成并验收候选。** Day 6 的 compact 只返回候选。用候选重建 Context，要求不再遗漏待摘要历史、估算严格小于原 view，并且不高于输入额度的 65%。通过后才写入 summary。
+5. **执行 Hook 后复验。** apply_before_model 可能改变消息，所以再次检查工具配对和输入额度，最后返回 request_view。
+
+`session.memory_ids` 在本版是“曾召回记忆”的保守集合，不是“本轮真正纳入 Context”的精确集合。即使某条记忆因预算未被选中，其 ID 也可能进入摘要依赖；遗忘它可能导致摘要被拒绝。精细来源追踪属于后续改进。
+
+`needs_compaction=True` 表示旧历史暂时未放入视图，不能直接把该视图发送给模型。本版先把旧历史压成摘要，再重新构建。若 build_context 已经因近期必需内容过大而抛错，就无法进入该分支；这是基础版限制。
+
+## retry 为什么只设置标记
+
+例如第一次请求返回 HTTP 400，错误正文包含 `context_length_exceeded`：
+
+```text
+run_loop 捕获 APIStatusError
+  → 确认还有请求次数
+  → retry 返回 True，并设置 force_compaction / overflow_retried
+  → run_loop 回到下一轮 prepare
+  → prepare 压缩并验收
+  → run_loop 再请求模型
+```
+
+retry 不调用模型，也不在内部重新运行 Loop。`overflow_retried` 在当前 Runtime 内只允许一次恢复；成功压缩只清除 `force_compaction`，不重置重试机会。第二次超限、其他 HTTP 状态或无法识别的错误交回 Loop 失败处理。
+
+这里识别的是 HTTP 400 加错误正文关键词，不是所有供应商错误格式的通用识别器。压缩没有可用范围或未达到目标时，prepare 直接失败，不能声称“所有超限都可恢复”。
+
+这次重试只重新请求模型，不重新执行已提交结果的工具。运行总时限仍由 Loop 控制；本版主请求计数不包含独立摘要调用，Day 9 的共享包装才把摘要也纳入共享调用预算。
 
 ## 完整练习骨架
 
@@ -160,7 +213,27 @@ async def run_session_task(
 
 ## 怎样核对
 
-构建 Services 并调用 run_session_task，串起召回、工具、压缩、存储与恢复。调试器确认最终仍进入 Day 1 的 run_loop。遗忘关联摘要的记忆后，旧摘要应被拒绝而不是静默复用。
+完成练习后，使用同一个 JsonStore 构造 MemoryStore 和 Services，并调用 create_session 创建属于可信 scope 的会话。workspace 必须是实际存在的工具工作目录。
+
+- 新任务传 `run_session_task(session_id, prompt, services)`；已经完成的会话可以在同一 ID 上追加新任务。
+- 显式恢复传 `prompt=None`，仅在没有 pending 工具且历史末尾为用户输入或完整工具结果批次时允许。它不是通用的中断工具重放入口。
+- 恢复时若仍需记忆召回，应传入合适的 `recall_query`；默认 `prompt=None` 会使查询为空，本版不会自动提取原任务作为查询。
+- Session 与 Memory 使用同一个 database，allowed_scopes 由可信调用方提供；不要让模型决定访问范围。
+- 当前 CLI 默认使用基础 Runtime，运行 `zeta -p ...` 不能证明本日 ContextRuntime 已接入。调试器应确认进入 run_session_task 和同一个 run_loop。
+
+| 场景 | 需要观察的结果 |
+| --- | --- |
+| 普通短任务 | 无不必要压缩，最终消息通过配对和预算检查 |
+| 长历史达到主动触发条件 | 有旧完整任务才主动压缩；候选通过后才更新 summary |
+| Context 标记旧历史未纳入 | 必须先摘要并重建，不能直接发送不完整视图 |
+| 候选为空、未缩小或超过 65% | 不覆盖原 summary；失败原因向 Loop 传播，Session 终态可改变 |
+| 当前任务本身超预算 | 明确失败，记录为基础版不支持，不把报错当作压缩成功 |
+| before_model 增加过多消息或破坏配对 | 最终检查拒绝发送；先前已提交的有效摘要不会因此回滚 |
+| 第一次明确的上下文超限 | 在剩余请求预算内，最多允许一次压缩后的模型重试 |
+| 摘要依赖的记忆被遗忘或不可访问 | read_summary 拒绝旧摘要，不静默复用 |
+| 历史存在未提交工具结果 | start 拒绝恢复，不自动重放可能有副作用的调用 |
+
+没有真实长历史时，压缩质量和恢复效果标为未验证。参考答案仍依赖前几天的源码正确完成，文档补全不代表现有 src 的完整链路已验收。
 
 不新增测试、mock、fixture 或内联自测。代码静态检查与实际模型/故障验收分开记录。
 
@@ -342,4 +415,12 @@ async def run_session_task(
 
 ## 与前后单元的关系
 
-Day 8 的 Worker 传入不同 Services 实例及共享请求包装，调用同一个 run_session_task。本日不增加第二个循环；当 Memory/Context/Compaction 需要调整时，应修改它们自己的策略而不是复制 Loop。
+Day 8 使用基础 Runtime 接入只读 MCP 工具；Day 9 的 Worker 传入不同 Services 实例及共享请求包装，调用同一个 run_session_task。本日不增加第二个循环；当 Memory/Context/Compaction 需要调整时，应修改它们自己的策略而不是复制 Loop。
+
+## 基础版之后再优化什么
+
+本日保留 Day 5–6 的简化策略：字节启发式估算、完整任务切分、80% 主动触发、65% 硬性验收、一次摘要请求。它能说明如何组装，但不保证长任务始终可以继续。
+
+后续按 [Compaction 优化方案](compaction-optimization.md) 分阶段调整：先修预算与触发顺序，再支持当前任务内部安全切分，最后加入分批摘要和提交一致性检查。这些变化涉及已有模块契约，不能只把 prepare 的阈值改小就算完成。
+
+另外，当前摘要函数仅检查消息/工具调用后返回文本，没有显式检查生成长度截断；摘要失败的原状态保护，也不等于“部分摘要绝不会被接收”。完成原因与 usage 返回契约需要在进阶阶段补齐。

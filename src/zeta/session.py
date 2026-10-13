@@ -135,10 +135,6 @@ def commit_tool_result(
         session = load_session(store, session_id)
         if session.pending.get(result.tool_call_id) != result.name:
             raise ValueError("unknown or already committed tool result")
-        entry = Entry(
-            message_json=encode([result]),
-            raw_json=encode([original]),
-        )
         session.entries.append(entry)
         del session.pending[result.tool_call_id]
         save_session(store, session)
